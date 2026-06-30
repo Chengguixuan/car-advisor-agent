@@ -1,11 +1,13 @@
 """命令行交互入口。
 
-提供交互式对话界面，管理对话历史，响应用户指令。
+提供交互式对话界面，管理对话历史，以结构化 JSON 格式展示推荐结果。
 """
 
+import json
 import logging
 import sys
 from pathlib import Path
+from typing import Any, Optional
 
 # 确保 src 目录在 sys.path 中，方便直接运行此文件
 _src_dir = Path(__file__).resolve().parent
@@ -13,8 +15,8 @@ if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
 
 from config import AppConfig, load_config
-from llm_client import LLMClient
-from prompts import SYSTEM_PROMPT, SHORTCUT_PROMPTS
+from llm_client import LLMClient, LLMError
+from prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -27,46 +29,103 @@ DIM = "\033[2m"
 GREEN = "\033[92m"
 BLUE = "\033[94m"
 YELLOW = "\033[93m"
+CYAN = "\033[96m"
+RED = "\033[91m"
 RESET = "\033[0m"
 
 WELCOME_MSG = f"""
 {BOLD}{BLUE}🚗 买车智能体 — 你的专业购车顾问{RESET}
 
-我可以帮你：
-  • 根据需求和预算推荐车型
-  • 对比多款车型的优缺点
-  • 分析燃油车 vs 新能源车的选择
-  • 梳理购车流程和贷款方案
+我会帮你理清需求、推荐合适的车型，并对你关心的问题给出建议。
+告诉你的想法，我们慢慢聊——
 
 {DIM}输入 {BOLD}/帮助{DIM} 查看快捷指令 | 输入 {BOLD}/退出{DIM} 结束对话{RESET}
 """
 
 HELP_MSG = f"""
 {BOLD}快捷指令：{RESET}
-  {GREEN}/对比{RESET}    对比多款车型
-  {GREEN}/新能源{RESET}  分析燃油车 vs 新能源
-  {GREEN}/流程{RESET}    了解购车流程
-  {GREEN}/贷款{RESET}    分析贷款方案
+  {GREEN}/清空{RESET}    清空对话历史
   {GREEN}/帮助{RESET}    显示此帮助信息
   {GREEN}/退出{RESET}    结束对话
-  {GREEN}/清空{RESET}    清空对话历史
 
-{DIM}也可以直接用自然语言描述你的需求。{RESET}
+{DIM}直接输入你的购车需求即可，例如：{RESET}
+  "预算 15 万，想买 SUV，家用为主，不太懂车"
 """
 
 EXIT_MSG = f"\n{BOLD}{GREEN}感谢使用买车智能体，祝你选到心仪的爱车！🚗{RESET}\n"
 
 
-def build_history_messages(history: list[dict]) -> list[dict]:
-    """将内部历史格式转为 LLM API 所需的消息列表。
+# ---------------------------------------------------------------------------
+# 结构化响应展示
+# ---------------------------------------------------------------------------
+
+
+def _print_divider(char: str = "─", width: int = 60) -> None:
+    print(f"{DIM}{char * width}{RESET}")
+
+
+def _print_model_card(model: dict, index: int) -> None:
+    """打印单个车型推荐卡片。"""
+    name = model.get("name", "未知车型")
+    price = model.get("price_range", "价格未提供")
+    pros = model.get("pros", [])
+    cons = model.get("cons", [])
+    reason = model.get("reason", "")
+
+    print(f"\n  {BOLD}{CYAN}#{index}  {name}{RESET}")
+    print(f"  {DIM}💰 落地参考价：{RESET}{price}")
+
+    if pros:
+        print(f"  {GREEN}✅ 优点：{RESET}")
+        for p in pros:
+            print(f"     • {p}")
+
+    if cons:
+        print(f"  {YELLOW}⚠️  缺点：{RESET}")
+        for c in cons:
+            print(f"     • {c}")
+
+    if reason:
+        print(f"  {BLUE}💡 推荐理由：{RESET}{reason}")
+
+
+def display_response(parsed: Optional[dict[str, Any]]) -> None:
+    """将模型的结构化 JSON 回复渲染到终端。
 
     Args:
-        history: 对话历史，每项为 {"role": "user"/"assistant", "content": "..."}
-
-    Returns:
-        API 格式的消息列表（不含 system）。
+        parsed: 模型返回的解析后 JSON 对象。
     """
-    return [{"role": h["role"], "content": h["content"]} for h in history]
+    if parsed is None:
+        print(f"{RED}未能获取有效的回复，请重试。{RESET}")
+        return
+
+    _print_divider()
+
+    # 1) 需求理解
+    understanding = parsed.get("understanding", "")
+    if understanding:
+        print(f"\n{BOLD}📋 需求理解：{RESET}{DIM}{understanding}{RESET}")
+
+    # 2) 推荐车型
+    models = parsed.get("recommended_models", [])
+    if models:
+        print(f"\n{BOLD}🚘 推荐车型：{RESET}")
+        for i, model in enumerate(models, 1):
+            _print_model_card(model, i)
+    else:
+        print(f"\n{DIM}暂无推荐，等待更多信息...{RESET}")
+
+    # 3) 追问
+    follow_up = parsed.get("follow_up_question")
+    if follow_up:
+        print(f"\n{BOLD}{CYAN}🤔 {follow_up}{RESET}")
+
+    _print_divider()
+
+
+# ---------------------------------------------------------------------------
+# 对话管理
+# ---------------------------------------------------------------------------
 
 
 def run_interactive(config: AppConfig) -> None:
@@ -75,14 +134,15 @@ def run_interactive(config: AppConfig) -> None:
     Args:
         config: 应用配置实例。
     """
-    # 初始化 LLM 客户端
+    # 检查 API Key
     if not config.llm.api_key:
-        print(f"{YELLOW}⚠ 未设置 LLM_API_KEY 环境变量，请检查 .env 文件{RESET}")
+        print(f"{YELLOW}⚠ 未设置 DEEPSEEK_API_KEY 环境变量，请检查 .env 文件{RESET}")
         print("  可以复制 .env.example 为 .env 并填入你的 API 密钥。\n")
         return
 
     client = LLMClient(config)
-    history: list[dict] = []
+    # history 存储 OpenAI 格式的消息
+    history: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     print(WELCOME_MSG)
 
@@ -99,7 +159,7 @@ def run_interactive(config: AppConfig) -> None:
         if not user_input:
             continue
 
-        # --- 处理内置指令 ---
+        # --- 内置指令 ---
         if user_input in ("/退出", "/quit", "/exit", "/q"):
             print(EXIT_MSG)
             break
@@ -109,97 +169,55 @@ def run_interactive(config: AppConfig) -> None:
             continue
 
         if user_input in ("/清空", "/clear"):
-            history.clear()
+            # 保留 system prompt，只清空对话
+            history = [{"role": "system", "content": SYSTEM_PROMPT}]
             print(f"{DIM}对话历史已清空。{RESET}")
             continue
 
-        # --- 处理快捷指令 -> 引导用户补充信息 ---
-        if user_input in ("/对比",):
-            print(f"\n{BOLD}请输入要对比的车型（每行一个），格式如下：{RESET}")
-            print(f"{DIM}  车型列表：{RESET}")
-            print(f"{DIM}  1. 丰田凯美瑞 2.0G 豪华版{RESET}")
-            print(f"{DIM}  2. 本田雅阁 260TURBO 豪华版{RESET}")
-            print(f"{DIM}  预算范围：20万{RESET}")
-            print(f"{DIM}  主要用途：日常通勤{RESET}")
-            user_input = input(f"\n{BOLD}{BLUE}你：{RESET}").strip()
-            if not user_input:
-                continue
-            user_input = (
-                "请帮我对比以下车型，从价格、油耗、空间、动力、配置、"
-                f"保值率等方面分析：\n\n{user_input}"
-            )
+        # --- 添加用户消息 ---
+        history.append({"role": "user", "content": user_input})
 
-        elif user_input in ("/新能源",):
-            print(f"\n{BOLD}请告诉我以下信息：{RESET}")
-            info = {}
-            info["annual_mileage"] = input(f"  年行驶里程约（公里）：").strip()
-            info["has_charger"] = input(f"  是否有固定车位/充电桩（是/否）：").strip()
-            info["usage_scenario"] = input(f"  主要使用场景：").strip()
-            info["budget"] = input(f"  预算（万元）：").strip()
-            info["hold_years"] = input(f"  计划持有年限：").strip()
-            user_input = (
-                f"我在燃油车和新能源车之间犹豫。请根据以下情况帮我分析：\n"
-                f"- 年行驶里程约 {info['annual_mileage']} 公里\n"
-                f"- 是否有固定车位/充电桩：{info['has_charger']}\n"
-                f"- 主要使用场景：{info['usage_scenario']}\n"
-                f"- 预算：{info['budget']} 万元\n"
-                f"- 计划持有年限：{info['hold_years']} 年"
-            )
+        # --- 限制历史长度 ---
+        max_turns = config.max_history_turns
+        if max_turns > 0:
+            # system prompt 不算在轮数内
+            conversation = history[1:]
+            if len(conversation) > max_turns * 2:
+                history = [history[0]] + conversation[-(max_turns * 2):]
 
-        elif user_input in ("/流程",):
-            situation = input(f"\n{BOLD}请简单描述你的情况（可选，按回车跳过）：{RESET}").strip()
-            user_input = "我准备近期买车，请帮我梳理一下完整的购车流程，包括选车、试驾、谈价、贷款、保险、提车、上牌等环节的注意事项。"
-            if situation:
-                user_input += f" 我的情况是：{situation}"
-
-        elif user_input in ("/贷款",):
-            print(f"\n{BOLD}请告诉我以下信息：{RESET}")
-            car_price = input(f"  目标车型价格（万元）：").strip()
-            down_payment = input(f"  首付预算（万元）：").strip()
-            monthly_income = input(f"  月收入（元）：").strip()
-            monthly_budget = input(f"  每月可用于养车的金额（元）：").strip()
-            user_input = (
-                f"请帮我分析一下购车贷款方案：\n"
-                f"- 目标车型价格：{car_price} 万元\n"
-                f"- 首付预算：{down_payment} 万元\n"
-                f"- 月收入：{monthly_income} 元\n"
-                f"- 每月可用于养车的金额：{monthly_budget} 元\n"
-                f"\n请帮我算一下合理的贷款方案，并提醒隐性成本。"
-            )
-
-        # --- 调用 LLM ---
-        print(f"\n{DIM}思考中...{RESET}\n")
+        # --- 调用 LLM（JSON 模式）---
+        print(f"\n{DIM}分析中...{RESET}\n")
         try:
-            # 限制历史轮数以控制 token 消耗
-            max_turns = config.max_history_turns
-            recent_history = (
-                history[-max_turns * 2 :] if max_turns > 0 else []
-            )
+            parsed = client.chat_json(messages=list(history))
 
-            # 构建 messages 列表（OpenAI 格式）
-            messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-            if recent_history:
-                messages.extend(build_history_messages(recent_history))
-            messages.append({"role": "user", "content": user_input})
+            # 显示结构化响应
+            display_response(parsed)
 
-            response = client.chat(messages=messages)
-
-            print(f"{BOLD}{GREEN}顾问：{RESET}{response}\n")
-
-            # 保存到历史
-            history.append({"role": "user", "content": user_input})
-            history.append({"role": "assistant", "content": response})
+            # 将助手回复保存到历史（以 JSON 字符串形式存储，便于模型理解上下文）
+            history.append({
+                "role": "assistant",
+                "content": json.dumps(parsed, ensure_ascii=False),
+            })
 
             if config.verbose:
+                token_count = sum(len(m["content"]) for m in history)
                 print(
-                    f"{DIM}[调试] 当前历史轮数: {len(history) // 2}, "
-                    f"token 估算: ~{sum(len(m['content']) for m in history) // 2}{RESET}"
+                    f"{DIM}[调试] 历史消息数: {len(history)}, "
+                    f"总字符数: ~{token_count}{RESET}"
                 )
 
-        except Exception as e:
-            print(f"{YELLOW}❌ 调用模型失败：{e}{RESET}")
+        except LLMError as e:
+            print(f"{RED}❌ {e}{RESET}")
             logger.exception("LLM call failed")
-            # 不要让一次失败中断整个会话
+            # 移除刚才添加的用户消息，避免历史中残留无对应回复的记录
+            if history and history[-1]["role"] == "user":
+                history.pop()
+            continue
+        except Exception as e:
+            print(f"{RED}❌ 意外错误：{e}{RESET}")
+            logger.exception("Unexpected error")
+            if history and history[-1]["role"] == "user":
+                history.pop()
             continue
 
 
