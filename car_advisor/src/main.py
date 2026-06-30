@@ -5,18 +5,11 @@
 
 import json
 import logging
-import sys
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-# 确保 src 目录在 sys.path 中，方便直接运行此文件
-_src_dir = Path(__file__).resolve().parent
-if str(_src_dir) not in sys.path:
-    sys.path.insert(0, str(_src_dir))
-
-from config import AppConfig, load_config
-from llm_client import LLMClient, LLMError, LLMResponseError
-from prompts import SYSTEM_PROMPT
+from .config import AppConfig, load_config
+from .llm_client import LLMClient, LLMError, LLMResponseError
+from .prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +186,7 @@ def run_interactive(config: AppConfig) -> None:
             break
 
         if not user_input:
+            print(f"{DIM}请输入你的购车需求，例如 \"预算 15 万，想买 SUV\"，或输入 help 查看帮助。{RESET}")
             continue
 
         # --- 内置指令 ---

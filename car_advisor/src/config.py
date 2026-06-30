@@ -49,16 +49,31 @@ def load_config() -> AppConfig:
         MAX_HISTORY:          对话历史最大轮数（默认 20）
         VERBOSE:              调试模式（默认 false）
     """
+    try:
+        temperature = float(os.getenv("DEEPSEEK_TEMPERATURE", "0.7"))
+    except ValueError:
+        temperature = 0.7
+
+    try:
+        max_tokens = int(os.getenv("DEEPSEEK_MAX_TOKENS", "4096"))
+    except ValueError:
+        max_tokens = 4096
+
     llm = LLMConfig(
         api_key=os.getenv("DEEPSEEK_API_KEY", ""),
-        base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-        model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
-        temperature=float(os.getenv("DEEPSEEK_TEMPERATURE", "0.7")),
-        max_tokens=int(os.getenv("DEEPSEEK_MAX_TOKENS", "4096")),
+        base_url=os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com/v1",
+        model=os.getenv("DEEPSEEK_MODEL") or "deepseek-chat",
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
+
+    try:
+        max_history_turns = int(os.getenv("MAX_HISTORY", "20"))
+    except ValueError:
+        max_history_turns = 20
 
     return AppConfig(
         llm=llm,
-        max_history_turns=int(os.getenv("MAX_HISTORY", "20")),
+        max_history_turns=max_history_turns,
         verbose=os.getenv("VERBOSE", "false").lower() in ("1", "true", "yes"),
     )

@@ -276,7 +276,7 @@ class LLMClient:
             return LLMRateLimitError(f"请求频率超限，请稍后重试: {msg}")
 
         # 连接错误
-        if "connection" in msg.lower() or "timeout" in msg.lower() or "connection error" in msg.lower():
+        if "connection" in msg.lower() or "timeout" in msg.lower() or "timed out" in msg.lower() or "connection error" in msg.lower():
             logger.error("DeepSeek connection failed: %s", msg)
             return LLMConnectionError(f"网络连接失败: {msg}")
 
