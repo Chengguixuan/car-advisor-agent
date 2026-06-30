@@ -176,11 +176,13 @@ def run_interactive(config: AppConfig) -> None:
                 history[-max_turns * 2 :] if max_turns > 0 else []
             )
 
-            response = client.chat(
-                system_prompt=SYSTEM_PROMPT,
-                user_message=user_input,
-                history=build_history_messages(recent_history),
-            )
+            # 构建 messages 列表（OpenAI 格式）
+            messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+            if recent_history:
+                messages.extend(build_history_messages(recent_history))
+            messages.append({"role": "user", "content": user_input})
+
+            response = client.chat(messages=messages)
 
             print(f"{BOLD}{GREEN}顾问：{RESET}{response}\n")
 
