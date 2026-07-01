@@ -7,14 +7,16 @@
 import pytest
 
 from car_advisor.src.main import (
-    _is_exit_command,
-    _is_help_command,
-    _is_clear_command,
     _trim_history,
-    display_response,
     WELCOME_MSG,
     HELP_MSG,
     EXIT_MSG,
+)
+from car_advisor.src.display import (
+    is_exit_command,
+    is_help_command,
+    is_clear_command,
+    display_recommendation,
 )
 from car_advisor.src.prompts import SYSTEM_PROMPT
 
@@ -34,13 +36,13 @@ class TestIsExitCommand:
         "/exit", "/quit", "/q", "/退出",
     ])
     def test_recognized(self, text):
-        assert _is_exit_command(text) is True
+        assert is_exit_command(text) is True
 
     @pytest.mark.parametrize("text", [
         "exitt", "quits", "", " 退出 ", "end",
     ])
     def test_not_recognized(self, text):
-        assert _is_exit_command(text) is False
+        assert is_exit_command(text) is False
 
 
 class TestIsHelpCommand:
@@ -51,13 +53,13 @@ class TestIsHelpCommand:
         "/help", "/h", "/帮助",
     ])
     def test_recognized(self, text):
-        assert _is_help_command(text) is True
+        assert is_help_command(text) is True
 
     @pytest.mark.parametrize("text", [
         "helpp", "helps", "", "?",
     ])
     def test_not_recognized(self, text):
-        assert _is_help_command(text) is False
+        assert is_help_command(text) is False
 
 
 class TestIsClearCommand:
@@ -67,13 +69,13 @@ class TestIsClearCommand:
         "/clear", "/清空",
     ])
     def test_recognized(self, text):
-        assert _is_clear_command(text) is True
+        assert is_clear_command(text) is True
 
     @pytest.mark.parametrize("text", [
         "clearr", "clear ", "", "reset",
     ])
     def test_not_recognized(self, text):
-        assert _is_clear_command(text) is False
+        assert is_clear_command(text) is False
 
 
 # ------------------------------------------------------------------
@@ -152,7 +154,7 @@ class TestDisplayResponse:
             ],
             "follow_up_question": "你对能源类型有什么偏好？",
         }
-        display_response(parsed)  # 不应抛出异常
+        display_recommendation(parsed)  # 不应抛出异常
 
     def test_empty_recommendations(self):
         parsed = {
@@ -160,7 +162,7 @@ class TestDisplayResponse:
             "recommended_models": [],
             "follow_up_question": "你的预算大概在什么范围？",
         }
-        display_response(parsed)
+        display_recommendation(parsed)
 
     def test_no_follow_up(self):
         parsed = {
@@ -176,7 +178,7 @@ class TestDisplayResponse:
             ],
             "follow_up_question": None,
         }
-        display_response(parsed)
+        display_recommendation(parsed)
 
     def test_minimal_response(self):
         parsed = {
@@ -184,10 +186,10 @@ class TestDisplayResponse:
             "recommended_models": [],
             "follow_up_question": None,
         }
-        display_response(parsed)
+        display_recommendation(parsed)
 
     def test_missing_fields_does_not_crash(self):
-        display_response({})
+        display_recommendation({})
 
 
 # ------------------------------------------------------------------

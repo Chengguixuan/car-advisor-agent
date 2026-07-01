@@ -5,11 +5,14 @@
 """
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Optional
 
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
 
 # 车型数据库路径
 _CAR_DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "car_data.json"
@@ -29,7 +32,7 @@ def load_car_db() -> list[dict]:
         with open(_CAR_DB_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"[tools] 加载车型数据失败: {e}")
+        logger.error("加载车型数据失败: %s", e)
         return []
 
 
