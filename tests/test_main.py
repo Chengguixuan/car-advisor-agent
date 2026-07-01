@@ -4,8 +4,6 @@
 以及与 DeepSeek API 的集成场景。
 """
 
-import os
-
 import pytest
 
 from car_advisor.src.main import (
@@ -248,7 +246,10 @@ class TestIntegration:
 
     @pytest.fixture(autouse=True)
     def check_api_key(self):
-        if not os.getenv("DEEPSEEK_API_KEY"):
+        from car_advisor.src.config import load_config
+
+        cfg = load_config()
+        if not cfg.llm.api_key:
             pytest.skip("DEEPSEEK_API_KEY 未设置，跳过集成测试")
 
     def _get_client(self):

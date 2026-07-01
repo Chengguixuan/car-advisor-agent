@@ -1,17 +1,24 @@
 """DeepSeek 大模型调用封装。
 
 DeepSeek API 兼容 OpenAI SDK 格式，通过 openai 库调用。
-支持文本对话和 JSON 模式输出。
+支持文本对话和 JSON 模式输出，含自动重试机制。
 """
 
 import json
 import logging
 import re
-from typing import Any, Optional
+import time
+from typing import Any, Callable, Optional, TypeVar
 
 from openai import OpenAI
 
 from .config import AppConfig, LLMConfig
+
+# 重试配置
+_MAX_RETRIES = 3          # 最大重试次数
+_RETRY_BACKOFF_BASE = 1.0  # 基础退避时间（秒），指数增长：1, 2, 4
+
+_T = TypeVar("_T")
 
 logger = logging.getLogger(__name__)
 
@@ -105,15 +112,15 @@ class LLMClient:
         logger.info("chat: sending %d messages, model=%s", len(messages), model or self._cfg.model)
         logger.debug("messages: %s", json.dumps(messages, ensure_ascii=False)[:500])
 
-        try:
-            resp = self._client.chat.completions.create(
+        resp = self._call_with_retry(
+            lambda: self._client.chat.completions.create(
                 model=model or self._cfg.model,
                 messages=messages,
                 temperature=temperature if temperature is not None else self._cfg.temperature,
                 max_tokens=max_tokens if max_tokens is not None else self._cfg.max_tokens,
-            )
-        except Exception as exc:
-            raise self._translate_error(exc)
+            ),
+            context="chat",
+        )
 
         # 提取文本内容
         try:
@@ -136,6 +143,9 @@ class LLMClient:
 
         return content
 
+    # JSON 指令标记，用于判断是否已追加
+    _JSON_INSTRUCTION = "请严格以合法的 JSON 格式回复，不要包含 markdown 代码块标记。"
+
     def chat_json(
         self,
         messages: list[dict[str, str]],
@@ -147,8 +157,9 @@ class LLMClient:
         """发送对话请求，返回解析后的 JSON 对象。
 
         DeepSeek API 通过 response_format={"type": "json_object"} 启用 JSON
-        模式，同时会在 system prompt 末尾追加 "请以 JSON 格式输出" 的指令
-        以确保模型输出严格合法的 JSON。
+        模式，同时在 system prompt 末尾追加 JSON 指令以确保模型输出合法 JSON。
+        如果 system prompt 已包含 JSON 指令则不会重复追加，避免多轮对话时
+        消息膨胀。
 
         Args:
             messages:    消息列表
@@ -163,14 +174,16 @@ class LLMClient:
             LLMResponseError: 返回内容不是合法 JSON
             其他同 chat()。
         """
-        # 浅拷贝 messages 以避免修改原始列表，并在 system prompt 中追加 JSON 指令
         augmented: list[dict[str, str]] = []
+        instruction_appended = False
+
         for m in messages:
             if m["role"] == "system":
-                augmented.append({
-                    "role": "system",
-                    "content": m["content"] + "\n\n请严格以合法的 JSON 格式回复，不要包含 markdown 代码块标记。",
-                })
+                content = m["content"]
+                if self._JSON_INSTRUCTION not in content:
+                    content = content + "\n\n" + self._JSON_INSTRUCTION
+                    instruction_appended = True
+                augmented.append({"role": "system", "content": content})
             else:
                 augmented.append(dict(m))
 
@@ -178,21 +191,26 @@ class LLMClient:
         if not any(m["role"] == "system" for m in augmented):
             augmented.insert(0, {
                 "role": "system",
-                "content": "请严格以合法的 JSON 格式回复，不要包含 markdown 代码块标记。",
+                "content": self._JSON_INSTRUCTION,
             })
+            instruction_appended = True
 
-        logger.info("chat_json: sending %d messages, json_mode=True", len(augmented))
+        logger.info(
+            "chat_json: sending %d messages, json_mode=True%s",
+            len(augmented),
+            " (instruction appended)" if instruction_appended else " (instruction already present)",
+        )
 
-        try:
-            resp = self._client.chat.completions.create(
+        resp = self._call_with_retry(
+            lambda: self._client.chat.completions.create(
                 model=model or self._cfg.model,
                 messages=augmented,
                 temperature=temperature if temperature is not None else min(self._cfg.temperature, 0.3),
                 max_tokens=max_tokens if max_tokens is not None else self._cfg.max_tokens,
                 response_format={"type": "json_object"},
-            )
-        except Exception as exc:
-            raise self._translate_error(exc)
+            ),
+            context="chat_json",
+        )
 
         try:
             raw = resp.choices[0].message.content or ""
@@ -205,6 +223,59 @@ class LLMClient:
     # ------------------------------------------------------------------
     # 内部方法
     # ------------------------------------------------------------------
+
+    def _call_with_retry(self, fn: Callable[[], _T], *, context: str = "") -> _T:
+        """带指数退避重试的 API 调用。
+
+        仅在网络连接错误和频率限制（429）时重试，认证错误和响应错误
+        直接抛出。
+
+        Args:
+            fn:      实际 API 调用的无参函数。
+            context: 调用上下文描述，用于日志。
+
+        Returns:
+            API 调用的返回值。
+
+        Raises:
+            LLMAuthenticationError: 认证失败（不重试）
+            LLMConnectionError:     网络错误（重试耗尽）
+            LLMRateLimitError:      频率限制（重试耗尽）
+            LLMError:               其他错误
+        """
+        last_exc: Optional[LLMError] = None
+
+        for attempt in range(1, _MAX_RETRIES + 1):
+            try:
+                return fn()
+            except Exception as exc:
+                translated = self._translate_error(exc)
+                last_exc = translated
+
+                # 认证错误不重试
+                if isinstance(translated, LLMAuthenticationError):
+                    raise translated
+
+                # 连接和限流错误可以重试
+                retryable = isinstance(translated, (LLMConnectionError, LLMRateLimitError))
+                if not retryable:
+                    raise translated
+
+                if attempt < _MAX_RETRIES:
+                    delay = _RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    logger.warning(
+                        "%s: attempt %d/%d failed (%s), retrying in %.1fs...",
+                        context or "call", attempt, _MAX_RETRIES, translated, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        "%s: all %d attempts failed, last error: %s",
+                        context or "call", _MAX_RETRIES, translated,
+                    )
+
+        # 所有重试耗尽
+        raise last_exc  # type: ignore[misc]
 
     def _build_client(self) -> OpenAI:
         """创建 OpenAI 兼容客户端，指向 DeepSeek API。"""

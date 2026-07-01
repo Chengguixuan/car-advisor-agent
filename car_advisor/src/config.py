@@ -10,8 +10,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # 加载项目根目录下的 .env 文件
-ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(ENV_FILE)
+# config.py → src/ → car_advisor/ → 项目根目录
+_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
+load_dotenv(_ENV_FILE)
 
 
 @dataclass
