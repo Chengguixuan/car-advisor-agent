@@ -13,3 +13,9 @@ venv/
 # IDE
 .vscode/
 .idea/
+
+# Vector database
+chroma_db/
+
+# Eval output
+data/eval_results.json

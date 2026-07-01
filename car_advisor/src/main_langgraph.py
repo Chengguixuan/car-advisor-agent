@@ -1,15 +1,18 @@
 """LangGraph 版本 — 命令行交互入口（v2）。
 
 使用 LangGraph 状态图替代单轮 LLM 调用，支持：
-- 工具调用（搜索 / 对比 / 在线查询）
-- 多步推理（chatbot ⇄ tools 循环）
-- 流式输出，每步可见
+- 工具调用（搜索 / 对比 / RAG 语义检索）
+- 多步推理（chatbot ⇄ tools 循环）+ 自动兜底
+- 流式输出，每步可见 + 信息来源标注
 - 结构化最终推荐
 - 多轮对话记忆（MemorySaver）
+- 启动时自动构建向量索引
 """
 
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import HumanMessage
@@ -31,10 +34,11 @@ from .prompts import SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
 WELCOME_MSG = f"""
-{BOLD}{BLUE}🚗 买车智能体 v2 (LangGraph){RESET}
+{BOLD}{BLUE}🚗 买车智能体 v2 (LangGraph + RAG){RESET}
 
 我现在的能力更强了：
-  • 自动搜索车型数据库，匹配合适的车型
+  • 结构化搜索 — 精确匹配预算和车型
+  • RAG 语义检索 — 理解模糊需求，找到最相关的车
   • 多款车型参数对比
   • 多步推理，综合分析后给出推荐
 
@@ -84,6 +88,49 @@ def _get_tool_calls(msg) -> list:
 # ---------------------------------------------------------------------------
 
 
+def _ensure_index() -> bool:
+    """启动时检查并构建向量索引。
+
+    Returns:
+        索引是否已就绪。
+    """
+    # 计算 chroma_db 路径（与 vector_store 一致）
+    chroma_dir = (
+        Path(__file__).resolve().parent.parent.parent / "chroma_db"
+    )
+    if chroma_dir.exists() and any(chroma_dir.iterdir()):
+        logger.info("向量索引已存在: %s", chroma_dir)
+        return True
+
+    print(f"{DIM}🔧 首次运行，正在构建车型语义索引...{RESET}")
+    try:
+        from .rag.vector_store import CarVectorStore
+        store = CarVectorStore()
+        store.build_index()
+        print(f"{DIM}  ✅ 索引构建完成 ({chroma_dir}){RESET}")
+        return True
+    except Exception as e:
+        logger.exception("索引构建失败")
+        print(f"{YELLOW}  ⚠ 语义索引构建失败: {e}{RESET}")
+        print(f"{YELLOW}    结构化搜索仍可用，但语义检索将不可用。{RESET}")
+        return False
+
+
+def _extract_source_from_tool_result(data: dict | list) -> str:
+    """从工具返回的 JSON 中提取来源标签。"""
+    if isinstance(data, dict):
+        src = data.get("source", "")
+        if src:
+            return src
+        # compare_cars 格式
+        if "matched" in data:
+            return "本地数据库"
+    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+        if "source" in data[0]:
+            return "语义检索"
+    return ""
+
+
 def main() -> None:
     """LangGraph v2 入口。"""
     logging.basicConfig(
@@ -100,6 +147,9 @@ def main() -> None:
     thread_config: dict[str, Any] = {"configurable": {"thread_id": "user_001"}}
 
     print(WELCOME_MSG)
+
+    # 启动时自动构建索引
+    _ensure_index()
 
     while True:
         try:
@@ -170,13 +220,21 @@ def main() -> None:
                         data = json.loads(content)
                     except json.JSONDecodeError:
                         continue
+
+                    # 提取来源标签
+                    source_label = _extract_source_from_tool_result(data)
+
                     if isinstance(data, list):
                         if data:
-                            print(f"{DIM}  ✅ 找到 {len(data)} 款候选车型{RESET}")
+                            src = f"（{source_label}）" if source_label else ""
+                            print(f"{DIM}  ✅ 找到 {len(data)} 款候选车型 {src}{RESET}")
                     elif isinstance(data, dict):
+                        results = data.get("results", [])
                         matched = data.get("matched", [])
-                        if matched:
-                            print(f"{DIM}  ✅ 对比 {len(matched)} 款车型{RESET}")
+                        if results or matched:
+                            items = results or matched
+                            src = f"（{source_label}）" if source_label else ""
+                            print(f"{DIM}  ✅ 找到 {len(items)} 条结果 {src}{RESET}")
                     continue
 
                 # --- 助手文本回复 ---

@@ -1,7 +1,13 @@
 """购车智能体工具集。
 
-提供本地车型搜索、对比和在线搜索（模拟）三个工具，
-供 LangGraph Agent 在推理过程中调用。
+提供本地车型搜索、RAG 语义检索、车型对比和在线搜索（模拟）
+四个工具，供 LangGraph Agent 在推理过程中调用。
+
+工具选择指南：
+- 用户给出明确预算/车型 → search_local_cars（结构化匹配 + RAG 兜底）
+- 用户想深入了解某款车 → rag_search（语义检索口碑/卖点/参数）
+- 用户对比多款车 → compare_cars（并排对比）
+- 查最新行情/优惠 → search_online（模拟）
 """
 
 import json
@@ -252,8 +258,181 @@ def search_online(query: str) -> str:
     return json.dumps(mock_results, ensure_ascii=False, indent=2)
 
 
+@tool
+def rag_search(query: str) -> str:
+    """语义搜索车型文档库，获取深度信息。
+
+    当用户的需求比较模糊、或者结构化搜索匹配不到结果时，
+    使用此工具基于语义相似度从车型文档中检索相关内容。
+
+    覆盖的信息包括：
+    - 车型核心卖点和详细介绍（~260字/车）
+    - 用户口碑（优缺点）
+    - 适用场景推荐
+    - 详细参数列表
+
+    适用场景：
+    - 用户需求模糊：如"我想要一辆舒服的车"、"适合新手开的车"
+    - 结构化搜索返回太少结果时自动兜底
+    - 需要了解车型口碑和实际使用体验
+
+    Args:
+        query: 自然语言查询。例如 "省油的家用SUV推荐"、"长途开什么车舒服"。
+
+    Returns:
+        JSON 字符串，包含相关文档片段列表。
+        每个结果包含 content（文本内容）、title（车型名）、
+        category（类别）、energy_type（能源类型）、
+        price_range（价格区间）、section（文档类型）等字段。
+    """
+    try:
+        from .rag.retriever import _get_store
+    except ImportError:
+        return json.dumps(
+            {"error": "RAG 模块未加载，请先运行 data/build_index.py 构建索引"},
+            ensure_ascii=False,
+        )
+
+    store = _get_store()
+    docs = store.search(query, k=5)
+
+    results = []
+    for doc in docs:
+        results.append({
+            "content": doc.page_content[:400],
+            "title": doc.metadata.get("title", ""),
+            "category": doc.metadata.get("category", ""),
+            "energy_type": doc.metadata.get("energy_type", ""),
+            "price_range": doc.metadata.get("price_range", ""),
+            "section": doc.metadata.get("section", ""),
+            "source": doc.metadata.get("source", ""),
+        })
+
+    logger.info("rag_search: '%s' → %d results", query[:60], len(results))
+    return json.dumps(results, ensure_ascii=False, indent=2)
+
+
+# ==========================================================================
+# 内部：去重合并
+# ==========================================================================
+
+
+def _merge_and_dedupe(
+    structured: list[dict],
+    rag_results: list[dict],
+    max_items: int = 5,
+) -> list[dict]:
+    """合并结构化搜索和 RAG 结果，按车型名去重。
+
+    Args:
+        structured: 结构化搜索结果。
+        rag_results: RAG 语义搜索结果。
+        max_items:   返回最大条数。
+
+    Returns:
+        去重合并后的车型列表。
+    """
+    seen: set[str] = set()
+    merged: list[dict] = []
+
+    def _key(item: dict) -> str:
+        return (item.get("title", "") or item.get("name", "")).lower()
+
+    # 先放结构化结果
+    for item in structured:
+        k = _key(item)
+        if k and k not in seen:
+            seen.add(k)
+            merged.append(item)
+
+    # 再补充 RAG 结果
+    for item in rag_results:
+        k = _key(item)
+        if k and k not in seen:
+            seen.add(k)
+            # 转换为简化格式
+            merged.append({
+                "name": item.get("title", ""),
+                "category": item.get("category", ""),
+                "energy_type": item.get("energy_type", ""),
+                "price_range": item.get("price_range", ""),
+                "section": item.get("section", ""),
+                "content": item.get("content", "")[:200],
+                "source": "语义检索",
+            })
+
+    return merged[:max_items]
+
+
+# ==========================================================================
+# 修改 search_local_cars：结果不足时自动 RAG 兜底
+# ==========================================================================
+
+# 保存原始的 search_local_cars 逻辑，用于重新包装
+_search_local_cars_original = search_local_cars
+
+
+@tool
+def search_local_cars(budget: str, vehicle_type: str = "") -> str:  # type: ignore[no-redef]
+    """搜索符合预算和车型偏好的车辆（结构化匹配 + 语义兜底）。
+
+    优先使用价格区间和车型类型进行精确筛选。当匹配结果少于
+    3 条时，自动调用语义搜索补充相关车型，确保用户总能获得
+    足够的选择参考。
+
+    适用场景：
+    - 用户明确给出预算和/或车型偏好
+    - 如 "15-20万SUV"、"10万以内的轿车"
+    - 这是大多数场景的首选工具
+
+    Args:
+        budget:       预算区间。例如 "15-20万"、"20万左右"、"10万以内"。
+        vehicle_type: 车型偏好。例如 "SUV"、"轿车"、"MPV"。留空不限。
+
+    Returns:
+        JSON 字符串，包含匹配的车型列表（≥3条时有兜底）。
+        每项含 name、price_range、type、fuel、pros、cons 等。
+    """
+    # 先用结构化搜索
+    raw = _search_local_cars_original.invoke({"budget": budget, "vehicle_type": vehicle_type})
+    results = json.loads(raw)
+
+    # 结果 >= 3 条，直接返回
+    if len(results) >= 3:
+        logger.info("search_local_cars: %d results (no RAG needed)", len(results))
+        return json.dumps({"results": results, "source": "结构化搜索"}, ensure_ascii=False, indent=2)
+
+    # 结果不足，RAG 兜底
+    logger.info("search_local_cars: only %d results, falling back to RAG", len(results))
+
+    # 构建语义搜索查询
+    rag_query_parts = []
+    if vehicle_type:
+        rag_query_parts.append(vehicle_type)
+    rag_query_parts.append(f"预算{budget}")
+    rag_query = " ".join(rag_query_parts)
+
+    try:
+        rag_raw = rag_search.invoke({"query": rag_query})
+        rag_results = json.loads(rag_raw)
+    except Exception:
+        logger.warning("RAG fallback failed, returning structured results only")
+        return json.dumps(
+            {"results": results, "source": "结构化搜索（结果不足，语义搜索不可用）"},
+            ensure_ascii=False, indent=2,
+        )
+
+    merged = _merge_and_dedupe(results, rag_results)
+    logger.info("search_local_cars: merged → %d results", len(merged))
+
+    return json.dumps(
+        {"results": merged, "source": f"结构化({len(results)}条) + 语义搜索({len(rag_results)}条)"},
+        ensure_ascii=False, indent=2,
+    )
+
+
 # ==========================================================================
 # 工具列表
 # ==========================================================================
 
-tools = [search_local_cars, compare_cars, search_online]
+tools = [search_local_cars, compare_cars, search_online, rag_search]
