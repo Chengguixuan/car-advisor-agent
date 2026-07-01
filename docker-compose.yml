@@ -1,0 +1,49 @@
+# 买车智能体 — Docker Compose 编排
+# 启动: docker-compose up --build
+# 停止: docker-compose down
+
+version: "3.8"
+
+services:
+  # ---- 核心服务 ----
+  fastapi:
+    build: .
+    container_name: car-advisor-api
+    ports:
+      - "8000:8000"
+    environment:
+      # DeepSeek API 配置（从 .env 或环境变量读取）
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-https://api.deepseek.com/v1}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-deepseek-chat}
+      - DEEPSEEK_TEMPERATURE=${DEEPSEEK_TEMPERATURE:-0.7}
+      - DEEPSEEK_MAX_TOKENS=${DEEPSEEK_MAX_TOKENS:-4096}
+      # 向量模型镜像
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+      - HF_HUB_DISABLE_SYMLINKS_WARNING=1
+      # 日志
+      - MAX_HISTORY=20
+      - VERBOSE=false
+    volumes:
+      # 持久化向量索引（避免每次重启重建）
+      - ./chroma_db:/app/chroma_db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # ---- Redis（可选，当前版本用内存存储，预留）----
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: car-advisor-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis_data:/data
+  #   restart: unless-stopped
+
+# volumes:
+#   redis_data:

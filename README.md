@@ -1,85 +1,137 @@
 # 🚗 买车智能体 (Car Advisor)
 
-一个基于大语言模型的交互式购车顾问，帮助你理清需求、对比车型、
-分析优劣，做出更明智的购车决策。
+基于 LangGraph + RAG 的智能购车顾问，支持多轮对话、工具调用、
+语义检索，提供 CLI / API / Web 三种交互方式。
 
 ## 功能
 
-- **需求分析**：通过对话了解你的预算、用途、偏好，梳理购车需求
-- **车型推荐**：根据需求推荐合适的车型，涵盖燃油车和新能源车
-- **车型对比**：从价格、油耗、空间、动力、配置、保值率等多维度对比
-- **燃油 vs 新能源**：结合你的实际使用场景分析哪种更适合
-- **购车流程指导**：梳理选车、试驾、谈价、贷款、保险、提车等全流程
-- **贷款分析**：帮助计算合理的贷款方案，提醒隐性成本
+- **智能对话**：理解模糊需求，通过追问逐步明确用户偏好
+- **结构化搜索**：根据预算、车型、能源类型精确筛选
+- **RAG 语义检索**：向量搜索车型口碑、卖点、适用场景
+- **车型对比**：多车并排对比参数和优缺点
+- **多轮记忆**：MemorySaver 持久化对话上下文
+- **流式输出**：实时展示 Agent 推理过程（工具调用→结果→推荐）
 
 ## 环境要求
 
 - Python 3.11+
-- OpenAI API 密钥 或 Anthropic API 密钥
+- DeepSeek API Key（兼容 OpenAI 格式）
+- 可选：Docker & Docker Compose
 
 ## 快速开始
 
-### 1. 安装依赖
+### 方式一：Docker（推荐）
+
+```bash
+cp .env.example .env        # 编辑填入 DEEPSEEK_API_KEY
+docker-compose up --build   # 构建并启动
+```
+
+API 地址：http://localhost:8000
+API 文档：http://localhost:8000/docs
+前端界面：http://localhost:8501（需单独启动）
+
+### 方式二：本地 Python
 
 ```bash
 pip install -r requirements.txt
-```
-
-### 2. 配置环境变量
-
-```bash
 cp .env.example .env
-```
+# 编辑 .env，填入 DEEPSEEK_API_KEY
 
-编辑 `.env` 文件，填入你的 API 密钥：
-
-```ini
-LLM_PROVIDER=openai          # 或 anthropic
-LLM_API_KEY=sk-xxx           # 你的 API 密钥
-LLM_MODEL=gpt-4o             # 模型名称
-```
-
-### 3. 运行
-
-```bash
+# CLI 模式
 python -m car_advisor.src.main
+
+# LangGraph CLI（支持工具调用）
+python -m car_advisor.src.main_langgraph
+
+# API 服务
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+# Streamlit 前端
+streamlit run app/frontend/streamlit_app.py
 ```
+
+首次运行会自动下载 Embedding 模型（~80MB）并构建向量索引。
+国内用户推荐设置 `HF_ENDPOINT=https://hf-mirror.com` 加速下载。
 
 ## 项目结构
 
 ```
 car_advisor/
-├── src/
-│   ├── __init__.py          # 包说明
-│   ├── config.py            # 环境变量和配置管理
-│   ├── llm_client.py        # 大模型调用封装（OpenAI / Anthropic）
-│   ├── prompts.py           # 系统提示词和用户提示词模板
-│   └── main.py              # 命令行交互入口
-├── .env.example             # 环境变量示例文件
-├── requirements.txt         # 依赖清单
-└── README.md                # 项目说明
+├── app/                      # 服务化层
+│   ├── main.py               # FastAPI 入口
+│   ├── routes/chat.py        # /chat + /chat/stream API
+│   ├── services/agent_service.py  # Agent 调用封装
+│   ├── frontend/streamlit_app.py  # Streamlit 前端
+│   └── static/
+├── car_advisor/src/          # 核心引擎
+│   ├── config.py             # 配置管理
+│   ├── llm_client.py         # DeepSeek LLM 客户端
+│   ├── prompts.py            # 提示词模板
+│   ├── state.py              # LangGraph 状态定义
+│   ├── tools.py              # 工具集（搜索/对比/RAG）
+│   ├── graph.py              # Agent 状态图
+│   ├── main.py               # CLI v1（JSON 模式）
+│   ├── main_langgraph.py     # CLI v2（LangGraph）
+│   ├── display.py            # CLI 展示公共模块
+│   ├── rag/                  # RAG 检索模块
+│   │   ├── vector_store.py   # Chroma 向量存储
+│   │   └── retriever.py      # LangChain Retriever
+│   └── eval/                 # 评估模块
+│       ├── eval_dataset.py   # 12 题测试集
+│       └── run_eval.py       # 批量评估
+├── data/
+│   ├── car_data.json         # 结构化车型数据（5款）
+│   ├── car_docs/             # 车型详细文档（10款）
+│   └── build_index.py        # 向量索引构建脚本
+├── tests/                    # 单元 + 集成测试
+├── Dockerfile
+├── docker-compose.yml
+├── requirements.txt
+└── README.md
 ```
 
-## 使用说明
+## 环境变量
 
-启动后会进入交互式对话界面，你可以：
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `DEEPSEEK_API_KEY` | DeepSeek API 密钥（**必填**） | - |
+| `DEEPSEEK_BASE_URL` | API 地址 | `https://api.deepseek.com/v1` |
+| `DEEPSEEK_MODEL` | 模型名称 | `deepseek-chat` |
+| `DEEPSEEK_TEMPERATURE` | 生成温度 | `0.7` |
+| `DEEPSEEK_MAX_TOKENS` | 最大 Token | `4096` |
+| `HF_ENDPOINT` | HuggingFace 镜像 | `https://hf-mirror.com` |
+| `MAX_HISTORY` | 最大对话轮数 | `20` |
+| `VERBOSE` | 调试日志 | `false` |
 
-- **直接对话**：用自然语言描述你的需求
-- **快捷指令**：
-  - `/对比` — 对比多款车型
-  - `/新能源` — 分析燃油车 vs 新能源
-  - `/流程` — 了解购车流程
-  - `/贷款` — 分析贷款方案
-  - `/帮助` — 显示帮助信息
-  - `/清空` — 清空对话历史
-  - `/退出` — 结束对话
+## API 接口
 
-## 自定义 API 地址
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/` | API 说明 |
+| `GET` | `/health` | 健康检查 |
+| `POST` | `/chat` | 同步对话，返回 `ChatResponse` |
+| `POST` | `/chat/stream` | SSE 流式对话 |
 
-如果你使用本地模型或中转代理，可以在 `.env` 中设置：
+```bash
+# 测试
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"user_input": "推荐一款15万的SUV", "thread_id": "user_001"}'
+```
 
-```ini
-LLM_API_BASE=http://localhost:11434/v1
+## 测试
+
+```bash
+# 单元测试
+pytest tests/ -m "not integration" -v
+
+# 集成测试（需要 API Key）
+pytest tests/ -m integration -v
+
+# RAG 评估
+python data/build_index.py --force --test
+python -m car_advisor.src.eval.run_eval
 ```
 
 ## 许可证
