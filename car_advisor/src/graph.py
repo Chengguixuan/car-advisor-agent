@@ -17,6 +17,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from .config import load_config
+from .http_client import get_http_client
 from .prompts import SYSTEM_PROMPT
 from .state import CarAdvisorState
 from .tools import tools
@@ -41,6 +42,7 @@ def _build_llm() -> ChatOpenAI:
         base_url=cfg.base_url,
         temperature=cfg.temperature,
         max_tokens=cfg.max_tokens,
+        http_client=get_http_client(),
     )
 
 

@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional, TypeVar
 from openai import OpenAI
 
 from .config import AppConfig, LLMConfig
+from .http_client import get_http_client
 
 # 重试配置
 _MAX_RETRIES = 3          # 最大重试次数
@@ -20,7 +21,7 @@ _RETRY_BACKOFF_BASE = 1.0  # 基础退避时间（秒），指数增长：1, 2, 
 
 _T = TypeVar("_T")
 
-logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # 异常定义
@@ -288,6 +289,7 @@ class LLMClient:
         return OpenAI(
             api_key=self._cfg.api_key,
             base_url=self._cfg.base_url,
+            http_client=get_http_client(),
         )
 
     @staticmethod
