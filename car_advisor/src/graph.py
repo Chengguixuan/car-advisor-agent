@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 # 最大搜索次数，防止 Agent 无限循环
 _MAX_SEARCHES = 3
 
+# 上下文压缩阈值（消息条数超过此值触发压缩）
+_COMPRESS_THRESHOLD = 10          # 5 轮对话
+_COMPRESS_KEEP_LAST = 10          # 最近 10 条消息不压缩
+_SUMMARY_PROMPT = (
+    "请用2-3句话总结以下对话的核心信息，包括用户需求、排除项和已推荐的车型。"
+    "只输出摘要文本，不要包含任何其他内容。"
+)
+
 
 # ==========================================================================
 # 内部辅助
@@ -115,6 +123,65 @@ def build_agent() -> StateGraph:
     tool_executor = ToolNode(tools)
 
     # ------------------------------------------------------------------
+    # 内部：上下文压缩
+    # ------------------------------------------------------------------
+
+    def _compress_messages(all_messages: list) -> list:
+        """压缩消息历史：保留 system + 最近 N 条，中间生成摘要。
+
+        原始: [sys, m1, m2, m3, ..., m12]
+        压缩: [sys, summary_msg, m11, m12]   (保留最近 2 条示例)
+
+        Args:
+            all_messages: 完整消息列表（至少含 system prompt）。
+
+        Returns:
+            压缩后的消息列表。如果不需要压缩，返回原列表。
+        """
+        total = len(all_messages)
+        if total <= _COMPRESS_THRESHOLD:
+            return all_messages
+
+        # system prompt 始终保留
+        system_msg = all_messages[0]
+        # 中间部分：需要压缩的消息
+        middle = all_messages[1:total - _COMPRESS_KEEP_LAST]
+        # 最近的消息：保留不压缩
+        recent = all_messages[total - _COMPRESS_KEEP_LAST:]
+
+        if not middle:
+            return all_messages
+
+        logger.info(
+            "_compress: total=%d → keep=%d(system)+%d(recent), summarize=%d middle msgs",
+            total, 1, len(recent), len(middle),
+        )
+
+        # 构建摘要请求
+        summary_input = [{"role": "user", "content": _SUMMARY_PROMPT}] + list(middle)
+        try:
+            summary_resp = llm.invoke(summary_input)
+            summary_text = getattr(summary_resp, "content", "") or ""
+        except Exception as e:
+            logger.warning("_compress: summary generation failed: %s, truncating instead", e)
+            summary_text = "（对话历史过长，已截断早期内容）"
+
+        if not summary_text.strip():
+            summary_text = "（对话历史过长，已截断早期内容）"
+
+        summary_msg = {
+            "role": "system",
+            "content": f"[历史摘要] {summary_text.strip()}",
+        }
+
+        compressed = [system_msg, summary_msg] + recent
+        logger.info(
+            "_compress: done — %d msgs → %d msgs (saved %d tokens)",
+            total, len(compressed), total - len(compressed),
+        )
+        return compressed
+
+    # ------------------------------------------------------------------
     # 节点定义
     # ------------------------------------------------------------------
 
@@ -124,6 +191,11 @@ def build_agent() -> StateGraph:
 
         if not messages or _get_role(messages[0]) != "system":
             messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(messages)
+
+        # 上下文压缩：超过阈值时自动压缩早期消息
+        original_count = len(messages)
+        messages = _compress_messages(messages)
+        compression_applied = len(messages) < original_count
 
         logger.info("chatbot: invoking with %d messages", len(messages))
         try:
@@ -175,10 +247,16 @@ def build_agent() -> StateGraph:
         except (json.JSONDecodeError, KeyError, TypeError):
             pass  # 非 JSON 响应，不影响正常流程
 
+        # 保存压缩摘要
+        if compression_applied and len(messages) >= 2:
+            second = messages[1]
+            if isinstance(second, dict) and "[历史摘要]" in second.get("content", ""):
+                result["history_summary"] = second["content"]
+
         tool_calls = getattr(response, "tool_calls", []) or []
         logger.info(
-            "chatbot: role=%s, tool_calls=%d",
-            getattr(response, "role", "?"), len(tool_calls),
+            "chatbot: role=%s, tool_calls=%d, compressed=%s",
+            getattr(response, "role", "?"), len(tool_calls), compression_applied,
         )
 
         return result

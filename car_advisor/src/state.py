@@ -76,3 +76,5 @@ class CarAdvisorState(TypedDict):
     exclusions: list[str]            # 排除项，如 ["日系", "纯电"]
     preferences: list[str]           # 偏好项，如 ["空间大", "省油"]
     car_opinions: dict[str, Any]     # 对具体车型的评价，如 {"CR-V": "隔音差"}
+    # 上下文压缩
+    history_summary: Optional[str]   # 历史摘要，超过 5 轮时自动生成
