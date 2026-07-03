@@ -53,6 +53,18 @@ class CarAdvisorState(TypedDict):
             搜索次数计数器。每次"车型搜索"节点执行后 +1。
             用于防止 Agent 无限循环搜索（结合 conditional edge 判断）。
             初始值为 0。
+
+        exclusions:
+            用户明确排除的项。例如 ["日系", "纯电", "CVT变速箱"]。
+            由 intent="preference" 的 chatbot 节点更新。
+
+        preferences:
+            用户表达的偏好。例如 ["空间大", "省油", "安全性好"]。
+            由 intent="preference" 的 chatbot 节点更新。
+
+        car_opinions:
+            用户对具体车型的评价。例如 {"本田CR-V": "隔音差", "比亚迪宋PLUS": "性价比高"}。
+            由 intent="opinion" 的 chatbot 节点记录。
     """
 
     messages: Annotated[list, add_messages]
@@ -60,3 +72,7 @@ class CarAdvisorState(TypedDict):
     candidates: Optional[list[dict[str, Any]]]
     final_recommendation: Optional[dict[str, Any]]
     search_count: int
+    # 多意图支持
+    exclusions: list[str]            # 排除项，如 ["日系", "纯电"]
+    preferences: list[str]           # 偏好项，如 ["空间大", "省油"]
+    car_opinions: dict[str, Any]     # 对具体车型的评价，如 {"CR-V": "隔音差"}

@@ -12,7 +12,9 @@ import logging
 from typing import Any, Literal
 
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
+import sqlite3
+from pathlib import Path
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
@@ -106,7 +108,7 @@ def build_agent() -> StateGraph:
         search_count 达到 _MAX_SEARCHES 后，强制路由到 finalize。
 
     Returns:
-        编译后的 StateGraph，含 MemorySaver checkpointer。
+        编译后的 StateGraph，含 SqliteSaver checkpointer。
     """
     llm = _build_llm()
     model_with_tools = llm.bind_tools(tools)
@@ -117,7 +119,7 @@ def build_agent() -> StateGraph:
     # ------------------------------------------------------------------
 
     def chatbot(state: CarAdvisorState) -> dict[str, Any]:
-        """对话节点：调用 LLM，可能产生工具调用或文本回复。"""
+        """对话节点：调用 LLM，根据 intent 分流处理。"""
         messages = state["messages"]
 
         if not messages or _get_role(messages[0]) != "system":
@@ -128,9 +130,50 @@ def build_agent() -> StateGraph:
             response = model_with_tools.invoke(messages)
         except Exception as exc:
             logger.exception("chatbot: LLM invocation failed")
-            # 返回错误消息给用户，避免整个图崩溃
             from langchain_core.messages import AIMessage
             return {"messages": [AIMessage(content=f"抱歉，调用模型时出现错误：{exc}")]}
+
+        # 解析 LLM 响应中的 intent
+        content = getattr(response, "content", "") or ""
+        result: dict[str, Any] = {"messages": [response]}
+
+        try:
+            parsed = json.loads(content)
+            intent = parsed.get("intent", "search")
+            logger.info("chatbot: intent=%s", intent)
+
+            if intent == "preference":
+                # 更新 exclusions / preferences，不调工具
+                exclusions = state.get("exclusions", [])
+                preferences = state.get("preferences", [])
+                understanding = parsed.get("understanding", "")
+
+                # 从用户消息中提取排除项和偏好
+                if "日系" in content or "日本" in content:
+                    exclusions.append("日系")
+                if "纯电" in content:
+                    exclusions = list(set(exclusions + ["纯电"])) if "不" not in content else exclusions
+
+                result["exclusions"] = exclusions
+                result["preferences"] = preferences
+                logger.info("chatbot: updated exclusions=%s, preferences=%s", exclusions, preferences)
+
+            elif intent == "opinion":
+                # 记录用户对具体车型的评价
+                opinions = dict(state.get("car_opinions", {}))
+                understanding = parsed.get("understanding", "")
+                recommendations = parsed.get("recommended_models", [])
+                for m in recommendations:
+                    name = m.get("name", "")
+                    if name and name not in opinions:
+                        opinions[name] = understanding
+                result["car_opinions"] = opinions
+                logger.info("chatbot: recorded opinion about %d cars", len(opinions))
+
+            # search / question → 正常流程，由 tools_condition 路由
+
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass  # 非 JSON 响应，不影响正常流程
 
         tool_calls = getattr(response, "tool_calls", []) or []
         logger.info(
@@ -138,7 +181,7 @@ def build_agent() -> StateGraph:
             getattr(response, "role", "?"), len(tool_calls),
         )
 
-        return {"messages": [response]}
+        return result
 
     def tool_node(state: CarAdvisorState) -> dict[str, Any]:
         """工具执行节点：运行 ToolNode 并更新计数器和候选车型。"""
@@ -301,7 +344,11 @@ def build_agent() -> StateGraph:
     graph.add_edge("tools", "chatbot")
     graph.add_edge("finalize", END)
 
-    return graph.compile(checkpointer=MemorySaver())
+    # SqliteSaver 持久化到本地文件，重启后保留对话历史
+    db_path = Path(__file__).resolve().parent.parent.parent / "checkpoints.db"
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
+    return graph.compile(checkpointer=checkpointer)
 
 
 def _get_role(msg) -> str:

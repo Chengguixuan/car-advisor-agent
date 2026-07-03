@@ -1,17 +1,18 @@
 """购车智能体工具集。
 
-提供本地车型搜索、RAG 语义检索、车型对比和在线搜索（模拟）
+提供本地车型搜索、RAG 语义检索、车型对比和在线搜索
 四个工具，供 LangGraph Agent 在推理过程中调用。
 
 工具选择指南：
 - 用户给出明确预算/车型 → search_local_cars（结构化匹配 + RAG 兜底）
 - 用户想深入了解某款车 → rag_search（语义检索口碑/卖点/参数）
 - 用户对比多款车 → compare_cars（并排对比）
-- 查最新行情/优惠 → search_online（模拟）
+- 查最新行情/优惠 → search_online（Tavily 实时搜索，失败时模拟）
 """
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -215,30 +216,73 @@ def compare_cars(car_names: str) -> str:
 
 @tool
 def search_online(query: str) -> str:
-    """在线搜索汽车相关信息（当前为模拟数据）。
+    """在线搜索汽车最新资讯（通过 Tavily 实时搜索）。
 
-    用于获取本地数据库中没有的最新资讯，如：
-    - 最新优惠政策
-    - 车主真实口碑
-    - 专业评测
-    - 保值率数据
+    用于获取本地数据库中没有的实时信息：
+    - 最新优惠政策 / 降价信息
+    - 车主真实口碑和评测
+    - 行业新闻 / 新车型发布
+    - 保值率 / 销量数据
+
+    适用场景：
+    - 用户询问最新行情："XX车现在有什么优惠？"
+    - 查询口碑："XX车车主评价怎么样？"
+    - 了解市场动态："2025年最值得买的SUV"
 
     Args:
-        query: 搜索关键词。例如 "比亚迪宋PLUS 2025款 最新优惠"。
+        query: 搜索关键词。例如 "比亚迪宋PLUS 2025款 最新优惠 口碑"。
 
     Returns:
-        JSON 字符串，包含模拟的搜索结果。
+        JSON 字符串，包含 Tavily 实时搜索结果。
     """
-    # 模拟搜索结果 — 后续可接入真实的搜索 API
-    mock_results = {
+    try:
+        from langchain_tavily import TavilySearch
+
+        api_key = os.environ.get("TAVILY_API_KEY", "")
+        if not api_key:
+            logger.warning("TAVILY_API_KEY not set, falling back to mock")
+            return json.dumps(_mock_search(query), ensure_ascii=False, indent=2)
+
+        tavily = TavilySearch(
+            api_key=api_key,
+            max_results=5,
+            search_depth="basic",
+            include_answer=True,
+        )
+        results = tavily.invoke(query)
+
+        formatted = {
+            "query": query,
+            "source": "Tavily 实时搜索",
+            "answer": results.get("answer", ""),
+            "results": [
+                {
+                    "title": r.get("title", ""),
+                    "snippet": (r.get("content", "") or "")[:300],
+                    "url": r.get("url", ""),
+                }
+                for r in results.get("results", [])[:5]
+            ],
+        }
+        logger.info("search_online (Tavily): '%s' → %d results", query[:60], len(formatted["results"]))
+        return json.dumps(formatted, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        logger.warning("Tavily search failed: %s, falling back to mock", e)
+        return json.dumps(_mock_search(query), ensure_ascii=False, indent=2)
+
+
+def _mock_search(query: str) -> dict:
+    """Tavily 不可用时的兜底结果。"""
+    return {
         "query": query,
-        "source": "模拟在线搜索",
-        "disclaimer": "以下为模拟数据，实际购车请以官方渠道为准。",
+        "source": "模拟在线搜索（Tavily 不可用）",
+        "disclaimer": "以下为模拟数据，设置 TAVILY_API_KEY 可启用实时搜索。",
         "results": [
             {
                 "title": f"关于「{query}」的搜索建议",
                 "snippet": (
-                    "建议您访问以下渠道获取最新信息："
+                    "建议访问以下渠道获取最新信息："
                     "1) 汽车之家 (autohome.com.cn) — 车主口碑和评测；"
                     "2) 懂车帝 (dongchedi.com) — 车型对比和优惠行情；"
                     "3) 品牌官网 — 最新配置和官方指导价；"
@@ -246,16 +290,8 @@ def search_online(query: str) -> str:
                 ),
                 "url": "https://www.autohome.com.cn",
             },
-            {
-                "title": "注意事项",
-                "snippet": (
-                    "网络报价仅供参考，实际价格以当地 4S 店报价为准。"
-                    "建议多对比 2-3 家经销商的报价，注意区分裸车价和落地价。"
-                ),
-            },
         ],
     }
-    return json.dumps(mock_results, ensure_ascii=False, indent=2)
 
 
 @tool

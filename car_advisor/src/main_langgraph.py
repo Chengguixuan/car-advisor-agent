@@ -14,7 +14,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
-
+ 
 from langchain_core.messages import HumanMessage
 
 from .config import load_config
