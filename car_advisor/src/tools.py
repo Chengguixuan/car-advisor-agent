@@ -43,7 +43,7 @@ def load_car_db() -> list[dict]:
         return []
 
 
-def _parse_budget(budget_str: str) -> tuple[float, float]:
+def _parse_budget(budget_str: str) -> Optional[tuple[float, float]]:
     """解析预算字符串，返回 (最低价, 最高价) 的数值区间。
 
     支持的格式：
@@ -57,7 +57,7 @@ def _parse_budget(budget_str: str) -> tuple[float, float]:
         budget_str: 用户输入的预算字符串。
 
     Returns:
-        (min_price, max_price) 元组，单位为万元。
+        (min_price, max_price) 元组；无法解析时返回 None。
     """
     budget_str = budget_str.strip()
 
@@ -83,25 +83,59 @@ def _parse_budget(budget_str: str) -> tuple[float, float]:
         margin = val * 0.1  # ±10%
         return (round(val - margin, 1), round(val + margin, 1))
 
-    # 无法解析，返回全范围
-    return (0, 999)
+    # 无法解析，返回 None 让上层触发追问
+    return None
+
+
+# 车型同义词映射表（用户常用词 → 数据库标准类型）
+_CAR_TYPE_SYNONYMS = {
+    "suv":    ["suv", "越野车", "城市越野", "吉普", "suv车型", "城市suv", "越野"],
+    "轿车":   ["轿车", "小轿车", "三厢车", "家用轿车", "sedan", "房车", "家轿", "小汽车"],
+    "mpv":    ["mpv", "商务车", "保姆车", "多用途车", "家用mpv", "七座车", "7座车"],
+    "跑车":   ["跑车", "小跑", "轿跑", "coupe"],
+    "旅行车": ["旅行车", "瓦罐", "wagon", "休旅车"],
+    "皮卡":   ["皮卡", "皮卡丘"],
+}
+
+
+def _normalize_car_type(raw: str) -> str:
+    """将用户输入的同义词归一化为数据库中的标准类型名。
+
+    Args:
+        raw: 原始车型名称，如 "越野车"、"房车"、"商务车"。
+
+    Returns:
+        标准车型名（suv / 轿车 / mpv / 跑车 / 旅行车 / 皮卡）。
+        未匹配时返回原字符串的小写形式。
+    """
+    raw_lower = raw.strip().lower()
+    for std_name, synonyms in _CAR_TYPE_SYNONYMS.items():
+        if raw_lower in synonyms:
+            return std_name
+    return raw_lower
 
 
 def _match_type(car_type: str, target: str) -> bool:
-    """检查车型是否匹配目标类型。
+    """检查车型是否匹配目标类型（支持同义词）。
 
     Args:
-        car_type: 车型类型（SUV / 轿车 / MPV）。
-        target:   用户想要的类型。
+        car_type: 车型类型（SUV / 轿车 / MPV 等数据库中的值）。
+        target:   用户输入的类型，支持同义词如 "越野车"→SUV、"房车"→轿车。
 
     Returns:
         是否匹配。
     """
     if not target:
         return True
-    target = target.strip().lower()
-    # 模糊匹配
-    return target in car_type.lower() or car_type.lower() in target
+
+    # 归一化后比较
+    std_target = _normalize_car_type(target)
+    std_car = _normalize_car_type(car_type)
+
+    if std_target == std_car:
+        return True
+    # 兜底：原模糊匹配
+    return std_target in std_car or std_car in std_target
 
 
 # ==========================================================================
@@ -128,7 +162,14 @@ def search_local_cars(budget: str, vehicle_type: str = "") -> str:
     if not cars:
         return json.dumps([], ensure_ascii=False)
 
-    min_price, max_price = _parse_budget(budget)
+    parsed = _parse_budget(budget)
+    if parsed is None:
+        return json.dumps({
+            "error": "budget_not_parsed",
+            "message": "无法理解你的预算范围，请明确告诉我，比如'15-20万'或'20万左右'。",
+        }, ensure_ascii=False)
+
+    min_price, max_price = parsed
     results: list[dict] = []
 
     for car in cars:
@@ -432,6 +473,10 @@ def search_local_cars(budget: str, vehicle_type: str = "") -> str:  # type: igno
     # 先用结构化搜索
     raw = _search_local_cars_original.invoke({"budget": budget, "vehicle_type": vehicle_type})
     results = json.loads(raw)
+
+    # 预算无法解析 → 直接返回错误，不触发 RAG 兜底
+    if isinstance(results, dict) and "error" in results:
+        return json.dumps(results, ensure_ascii=False, indent=2)
 
     # 结果 >= 3 条，直接返回
     if len(results) >= 3:

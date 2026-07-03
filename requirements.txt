@@ -19,3 +19,4 @@ python-multipart>=0.0.12
 gradio>=5.0.0
 langchain-tavily>=0.1.0
 langgraph-checkpoint-sqlite>=1.0.0
+msgpack>=1.0.0

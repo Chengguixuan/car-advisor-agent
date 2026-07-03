@@ -30,6 +30,7 @@ from .display import (
 )
 from .graph import build_agent
 from .prompts import SYSTEM_PROMPT
+from .utils import get_role, get_content, get_tool_calls
 
 logger = logging.getLogger(__name__)
 
@@ -55,32 +56,6 @@ HELP_MSG = f"""
 """
 
 EXIT_MSG = f"\n{BOLD}{GREEN}感谢使用买车智能体，祝你选到心仪的爱车！🚗{RESET}\n"
-
-
-# ---------------------------------------------------------------------------
-# 消息工具函数
-# ---------------------------------------------------------------------------
-
-
-def _get_role(msg) -> str:
-    """兼容 dict / LangChain Message 对象，获取消息角色。"""
-    if isinstance(msg, dict):
-        return msg.get("role", "")
-    return getattr(msg, "role", "") or getattr(msg, "type", "") or ""
-
-
-def _get_content(msg) -> str:
-    """兼容 dict / LangChain Message 对象，获取消息文本。"""
-    if isinstance(msg, dict):
-        return msg.get("content", "")
-    return getattr(msg, "content", "") or ""
-
-
-def _get_tool_calls(msg) -> list:
-    """兼容 dict / LangChain Message 对象，获取 tool_calls。"""
-    if isinstance(msg, dict):
-        return msg.get("tool_calls", []) or []
-    return getattr(msg, "tool_calls", []) or []
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +170,9 @@ def main() -> None:
                     continue
 
                 last_msg = messages[-1]
-                role = _get_role(last_msg)
-                content = _get_content(last_msg)
-                tool_calls = _get_tool_calls(last_msg)
+                role = get_role(last_msg)
+                content = get_content(last_msg)
+                tool_calls = get_tool_calls(last_msg)
 
                 # --- 工具调用 ---
                 if tool_calls:

@@ -9,6 +9,7 @@ finalize 节点生成结构化的最终推荐。
 
 import json
 import logging
+import re
 from typing import Any, Literal
 
 from langchain_openai import ChatOpenAI
@@ -23,6 +24,7 @@ from .http_client import get_http_client
 from .prompts import SYSTEM_PROMPT
 from .state import CarAdvisorState
 from .tools import tools
+from .utils import get_role
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +97,78 @@ def _parse_candidates_from_messages(messages: list) -> list[dict[str, Any]]:
             if name and name not in seen_names:
                 seen_names.add(name)
                 candidates.append(item)
+
+    return candidates
+
+
+# 参数筛选关键词（用户条件 → 从 candidates 中语义匹配）
+_PARAM_PATTERNS = [
+    (r"(百公里|零百|0-?100|零到一百)\s*(加速|提速).*?(\d+[\.]?\d*)\s*秒", "加速"),
+    (r"加速.*?(\d+[\.]?\d*)\s*秒", "加速"),
+    (r"(\d+[\.]?\d*)\s*秒.*?(破百|加速)", "加速"),
+    (r"续航.*?(\d+)\s*(公里|km)", "续航"),
+    (r"(\d+)\s*(公里|km).*?续航", "续航"),
+    (r"油耗.*?(\d+[\.]?\d*)\s*[Ll升]", "油耗"),
+    (r"电耗.*?(\d+[\.]?\d*)", "电耗"),
+    (r"空间.*?[大宽长]", "空间"),
+    (r"后备箱.*?(\d+)", "后备箱"),
+    (r"轴距.*?(\d+)", "轴距"),
+]
+
+
+def _detect_param_keywords(text: str) -> list:
+    """检测用户消息中的参数条件，返回 [(类型, 原文), ...] 列表。"""
+    found = []
+    for pattern, ptype in _PARAM_PATTERNS:
+        match = re.search(pattern, text)
+        if match:
+            found.append((ptype, match.group(0)))
+    return found
+
+
+def _filter_candidates_by_params(
+    candidates: list[dict],
+    param_conditions: list,
+    user_query: str,
+    llm,
+) -> list[dict]:
+    """用 LLM 从 candidates 中筛选符合参数条件的车型。
+
+    筛选失败时降级返回原始列表。
+    """
+    if not candidates or not param_conditions:
+        return candidates
+
+    car_lines = []
+    for i, car in enumerate(candidates):
+        name = car.get("name", "?")
+        specs = car.get("specs", {})
+        spec_str = " | ".join(f"{k}: {v}" for k, v in specs.items())
+        fuel_econ = car.get("fuel_economy", car.get("fuel", ""))
+        car_lines.append(f"{i+1}. {name} — {car.get('price_range','?')} | {fuel_econ} | {spec_str}")
+
+    conditions_str = "; ".join(f"{kw}: {raw}" for kw, raw in param_conditions)
+    filter_prompt = (
+        f"用户条件：{conditions_str}\n"
+        f"原始查询：{user_query}\n\n"
+        f"候选车型：\n" + "\n".join(car_lines) + "\n\n"
+        "请从以上候选车型中选出最符合用户参数条件的车型。\n"
+        "只返回车型编号，按匹配程度排序，用逗号分隔。例如：3, 1, 5"
+    )
+
+    try:
+        resp = llm.invoke([{"role": "user", "content": filter_prompt}])
+        content = getattr(resp, "content", "") or ""
+        logger.info("param_filter: LLM response — %s", content[:100])
+
+        ids = [int(s) for s in re.findall(r"\d+", content)]
+        filtered = [candidates[i - 1] for i in ids if 1 <= i <= len(candidates)]
+
+        if filtered:
+            logger.info("param_filter: %d → %d candidates", len(candidates), len(filtered))
+            return filtered
+    except Exception as e:
+        logger.warning("param_filter: failed — %s, keeping all", e)
 
     return candidates
 
@@ -189,7 +263,7 @@ def build_agent() -> StateGraph:
         """对话节点：调用 LLM，根据 intent 分流处理。"""
         messages = state["messages"]
 
-        if not messages or _get_role(messages[0]) != "system":
+        if not messages or get_role(messages[0]) != "system":
             messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(messages)
 
         # 上下文压缩：超过阈值时自动压缩早期消息
@@ -296,11 +370,29 @@ def build_agent() -> StateGraph:
         return result
 
     def finalize(state: CarAdvisorState) -> dict[str, Any]:
-        """推荐生成节点：综合所有信息输出最终购车建议。"""
+        """推荐生成节点：综合所有信息输出最终购车建议。
+
+        如果用户的最后一条消息中包含参数条件（加速/空间/续航/油耗等），
+        会先用 LLM 从 candidates 中筛选匹配的车型，再生成推荐。
+        """
         logger.info("finalize: generating recommendation")
 
         candidates = state.get("candidates") or []
         messages = list(state.get("messages", []))
+
+        # ---- 参数筛选 ----
+        if candidates:
+            last_user = ""
+            for m in reversed(messages):
+                role = get_role(m)
+                if role in ("user", "human"):
+                    last_user = m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")
+                    break
+
+            param_keywords = _detect_param_keywords(last_user)
+            if param_keywords:
+                logger.info("finalize: param filter detected — %s", param_keywords)
+                candidates = _filter_candidates_by_params(candidates, param_keywords, last_user, llm)
 
         # 构建候选车型摘要
         if candidates:
@@ -427,10 +519,3 @@ def build_agent() -> StateGraph:
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     checkpointer = SqliteSaver(conn)
     return graph.compile(checkpointer=checkpointer)
-
-
-def _get_role(msg) -> str:
-    """兼容 dict 和 Message 对象，获取消息的 role。"""
-    if isinstance(msg, dict):
-        return msg.get("role", "")
-    return getattr(msg, "role", "") or ""

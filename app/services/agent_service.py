@@ -22,6 +22,7 @@ if str(_project_root) not in sys.path:
 
 from car_advisor.src.graph import build_agent
 from car_advisor.src.prompts import SYSTEM_PROMPT
+from car_advisor.src.utils import serialize_messages
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +216,7 @@ class AgentService:
                             "event": "tool_result",
                             "data": {
                                 "node": node_name,
-                                "messages": _serialize_messages(messages),
+                                "messages": serialize_messages(messages),
                             },
                         }
 
@@ -261,17 +262,3 @@ class AgentService:
             yield {"event": "error", "data": {"message": str(exc)}}
 
 
-# ------------------------------------------------------------------
-# 辅助函数
-# ------------------------------------------------------------------
-
-
-def _serialize_messages(messages: list) -> list[dict]:
-    """将 LangChain Message 对象序列化为可 JSON 化的 dict。"""
-    result = []
-    for msg in messages:
-        result.append({
-            "role": getattr(msg, "type", "unknown"),
-            "content": getattr(msg, "content", ""),
-        })
-    return result
