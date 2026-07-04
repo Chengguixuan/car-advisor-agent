@@ -78,3 +78,4 @@ class CarAdvisorState(TypedDict):
     car_opinions: dict[str, Any]     # 对具体车型的评价，如 {"CR-V": "隔音差"}
     # 上下文压缩
     history_summary: Optional[str]   # 历史摘要，超过 5 轮时自动生成
+    called_tools: list[str]          # 本轮已调用的工具名，防止重复触发

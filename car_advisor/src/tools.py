@@ -1,11 +1,10 @@
 """购车智能体工具集。
 
-提供本地车型搜索、RAG 语义检索、车型对比和在线搜索
-四个工具，供 LangGraph Agent 在推理过程中调用。
+提供本地车型搜索、车型对比和在线搜索三个工具，
+供 LangGraph Agent 在推理过程中调用。
 
 工具选择指南：
-- 用户给出明确预算/车型 → search_local_cars（结构化匹配 + RAG 兜底）
-- 用户想深入了解某款车 → rag_search（语义检索口碑/卖点/参数）
+- 用户给出明确预算/车型 → search_local_cars（结构化匹配）
 - 用户对比多款车 → compare_cars（并排对比）
 - 查最新行情/优惠 → search_online（Tavily 实时搜索，失败时模拟）
 """
@@ -138,25 +137,86 @@ def _match_type(car_type: str, target: str) -> bool:
     return std_target in std_car or std_car in std_target
 
 
+# 排除品牌关键词 → 实际品牌名
+_EXCLUDE_BRAND_MAP = {
+    "日系": ["本田", "丰田", "日产", "马自达", "斯巴鲁", "三菱", "铃木", "雷克萨斯"],
+    "德系": ["大众", "奔驰", "宝马", "奥迪", "保时捷"],
+    "美系": ["福特", "别克", "雪佛兰", "凯迪拉克", "特斯拉"],
+    "国产": ["比亚迪", "吉利", "长安", "哈弗", "红旗", "零跑", "小鹏", "理想", "深蓝", "广汽埃安"],
+}
+
+
+def _match_fuel(car_fuel: str, user_fuel: str) -> bool:
+    """检查车型能源类型是否匹配用户需求（支持模糊匹配）。
+
+    用户说"混动" → 匹配 "油电混动(HEV)" 和 "插电混动(PHEV)"
+    用户说"纯电" → 匹配 "纯电动(BEV)"
+    """
+    uf = user_fuel.strip()
+    cf = car_fuel.strip().lower()
+
+    if uf == cf:
+        return True
+    if uf in cf:
+        return True
+    # 模糊同义
+    if uf in ("混动", "油电混合"):
+        return "混动" in cf or "hev" in cf
+    if uf in ("插混", "插电"):
+        return "插电" in cf or "phev" in cf
+    if uf in ("纯电", "电动"):
+        return "纯电" in cf or "bev" in cf
+    if uf in ("燃油", "汽油"):
+        return "燃油" in cf
+    if uf in ("增程", "增程式"):
+        return "增程" in cf
+    return False
+
+
 # ==========================================================================
 # LangChain 工具
 # ==========================================================================
 
 
-@tool
-def search_local_cars(budget: str, vehicle_type: str = "") -> str:
-    """从本地车型数据库中搜索符合条件的车型。
+def _extract_fuel_number(fuel_economy: str) -> Optional[float]:
+    """从 fuel_economy 字符串中提取油耗数值，如 '4.5L' → 4.5。"""
+    m = re.search(r"(\d+[\.]?\d*)\s*[Ll升]", fuel_economy)
+    return float(m.group(1)) if m else None
 
-    根据用户提供的预算区间和车型偏好筛选数据库中的车型，
-    返回匹配车型的 JSON 字符串列表。
+
+def _extract_range_km(fuel_economy: str) -> Optional[int]:
+    """从 fuel_economy 字符串中提取纯电续航，如 '纯电续航110km' → 110。"""
+    m = re.search(r"(?:纯电续航|续航|CLTC)\s*(\d+)\s*(?:km|公里)", fuel_economy)
+    return int(m.group(1)) if m else None
+
+
+@tool
+def search_local_cars(
+    budget: str,
+    vehicle_type: str = "",
+    fuel: str = "",
+    max_fuel_consumption: Optional[float] = None,
+    min_range: Optional[int] = None,
+    brand: str = "",
+    exclude_brand: str = "",
+) -> str:
+    """按预算/车型/能源/油耗/续航/品牌等条件筛选车型。
+
+    负责：固定参数筛选（价格、车型、能源、油耗、续航、品牌）。
+    不负责：车型对比（用compare_cars）、实时行情/优惠/口碑（用search_online）。
+    触发：用户给出明确筛选条件。例如 "15万SUV"、"油耗5L以下"。
 
     Args:
-        budget:        预算区间。例如 "15-20万"、"20万左右"、"10万以内"、"30万以上"。
-        vehicle_type:  车型偏好。例如 "SUV"、"轿车"、"MPV"。留空表示不限。
+        budget:              预算区间。例如 "15-20万"、"20万左右"。
+        vehicle_type:        车型偏好。例如 "SUV"、"轿车"、"MPV"。留空不限。
+        fuel:                能源类型。例如 "燃油"、"混动"、"纯电动"、"插电混动"、"增程式"。
+        max_fuel_consumption: 油耗上限（L/100km）。
+        min_range:            纯电续航下限（km）。
+        brand:                品牌偏好。
+        exclude_brand:        排除品牌，如"日系"、"德系"。
 
     Returns:
-        JSON 字符串，包含匹配的车型列表。如果没有匹配的车型则返回空数组。
-        每个车型包含 name、price_range、type、fuel、pros、cons 等字段。
+        JSON 字符串，包含匹配的车型列表。
     """
     cars = load_car_db()
     if not cars:
@@ -169,12 +229,18 @@ def search_local_cars(budget: str, vehicle_type: str = "") -> str:
             "message": "无法理解你的预算范围，请明确告诉我，比如'15-20万'或'20万左右'。",
         }, ensure_ascii=False)
 
+    # 排除品牌关键词映射
+    exclude_keywords = _EXCLUDE_BRAND_MAP.get(exclude_brand.strip(), [exclude_brand.strip()]) if exclude_brand.strip() else []
+
     min_price, max_price = parsed
     results: list[dict] = []
 
     for car in cars:
         price = car.get("price", 0)
         car_type = car.get("type", "")
+        car_brand = car.get("brand", "")
+        car_fuel = car.get("fuel", "")
+        fuel_economy = car.get("fuel_economy", "")
 
         # 价格匹配
         if not (min_price <= price <= max_price):
@@ -183,6 +249,31 @@ def search_local_cars(budget: str, vehicle_type: str = "") -> str:
         # 车型匹配
         if vehicle_type and not _match_type(car_type, vehicle_type):
             continue
+
+        # 能源类型匹配（模糊匹配，如用户说"混动"匹配"油电混动"和"插电混动"）
+        if fuel and not _match_fuel(car_fuel, fuel):
+            continue
+
+        # 油耗上限
+        if max_fuel_consumption is not None:
+            car_fc = _extract_fuel_number(fuel_economy)
+            if car_fc is None or car_fc > max_fuel_consumption:
+                continue
+
+        # 纯电续航下限
+        if min_range is not None:
+            car_range = _extract_range_km(fuel_economy)
+            if car_range is None or car_range < min_range:
+                continue
+
+        # 品牌偏好
+        if brand and brand.strip() not in car_brand:
+            continue
+
+        # 排除品牌
+        if exclude_keywords:
+            if any(kw in car_brand for kw in exclude_keywords):
+                continue
 
         # 返回精简版字段（不含 engine、power 等详细参数，供列表展示）
         results.append({
@@ -200,79 +291,103 @@ def search_local_cars(budget: str, vehicle_type: str = "") -> str:
 
 
 @tool
-def compare_cars(car_names: str) -> str:
-    """对比指定车型的详细参数。
+def compare_cars(car_names: str, exclude_brand: str = "") -> str:
+    """对比两款或多款车型的参数（价格/油耗/续航/尺寸/动力）。
 
-    接收逗号分隔的车型名称，从数据库中查找对应车型并返回
-    包含价格、动力、油耗、优缺点等完整信息的对比结果。
+    负责：多车型并排对比。
+    不负责：按条件筛选（用search_local_cars）、实时行情（用search_online）。
+    触发：用户明确说"A和B哪个好"、"对比A和B"、"比较一下"。
+
+    即使车型属于历史排除范围，仍正常返回，并在note中提醒。
 
     Args:
-        car_names: 车型名称，逗号分隔。例如 "宋PLUS, CR-V"。
+        car_names:    车型名称，逗号分隔。例如 "宋PLUS, CR-V"。
+        exclude_brand: 历史排除的品牌（如"日系"），仅用于提示。
 
     Returns:
-        JSON 字符串，包含匹配车型的完整信息列表。
-        未匹配到的车型名称会在 unmatched 字段中列出。
+        JSON 字符串，含 matched / unmatched / note 字段。
     """
     cars = load_car_db()
     if not cars:
-        return json.dumps({"matched": [], "unmatched": []}, ensure_ascii=False)
+        return json.dumps({"matched": [], "unmatched": [], "note": ""}, ensure_ascii=False)
 
+    exclude_keywords = _EXCLUDE_BRAND_MAP.get(exclude_brand.strip(), [exclude_brand.strip()]) if exclude_brand.strip() else []
     names = [n.strip() for n in car_names.split(",") if n.strip()]
     matched: list[dict] = []
     matched_names: set[str] = set()
+    excluded_matched: list[str] = []
 
     for query in names:
         found = False
         for car in cars:
-            # 大小写不敏感的模糊匹配（名称或品牌+车型）
             full_name = car.get("name", "")
             brand = car.get("brand", "")
             if query.lower() in full_name.lower() or query.lower() in brand.lower():
                 matched.append(car)
                 matched_names.add(query)
+                if exclude_keywords and any(kw in brand for kw in exclude_keywords):
+                    excluded_matched.append(car.get("name", ""))
                 found = True
                 break
-        # 如果精确匹配失败，尝试更宽松的匹配
         if not found:
             for car in cars:
                 full_name = car.get("name", "")
-                # 检查每个查询词是否都在车名中出现
                 query_chars = query.replace(" ", "").lower()
                 name_chars = full_name.replace(" ", "").lower()
                 if all(c in name_chars for c in query_chars if c.isalpha()):
                     matched.append(car)
                     matched_names.add(query)
+                    if exclude_keywords and any(kw in car.get("brand", "") for kw in exclude_keywords):
+                        excluded_matched.append(car.get("name", ""))
                     found = True
                     break
 
     unmatched = [n for n in names if n not in matched_names]
 
-    result = {
-        "matched": matched,
-        "unmatched": unmatched,
-    }
+    # 兜底：本地找不到的车型，尝试在线搜索补齐数据
+    if unmatched:
+        for name in unmatched[:]:
+            try:
+                online_raw = search_online.invoke({"query": f"{name} 车型参数 价格 油耗 优缺点"})
+                online_data = json.loads(online_raw)
+                answer = online_data.get("answer", "")
+                if answer:
+                    matched.append({
+                        "name": name,
+                        "brand": "",
+                        "price_range": "在线查询",
+                        "type": "",
+                        "fuel": "",
+                        "fuel_economy": "",
+                        "pros": [],
+                        "cons": [],
+                        "source": "在线搜索",
+                        "note": f"以下信息来自网络搜索：{answer[:200]}",
+                    })
+                    matched_names.add(name)
+                    unmatched.remove(name)
+            except Exception:
+                pass
 
+    note = ""
+    if excluded_matched:
+        note = f"你之前排除了{exclude_brand}，以下包含{'、'.join(excluded_matched)}（{exclude_brand}），请重新评估是否接受"
+
+    result = {"matched": matched, "unmatched": unmatched, "note": note}
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @tool
 def search_online(query: str) -> str:
-    """在线搜索汽车最新资讯（通过 Tavily 实时搜索）。
+    """联网搜索最新实时汽车信息（Tavily）。**这是唯一能获取实时数据的工具。**
 
-    用于获取本地数据库中没有的实时信息：
-    - 最新优惠政策 / 降价信息
-    - 车主真实口碑和评测
-    - 行业新闻 / 新车型发布
-    - 保值率 / 销量数据
+    **重要**：用户问优惠/降价/多少钱/口碑/评测/销量/行情/新闻时，
+    **必须调用此工具**，不能用训练数据或本地数据库回答。
 
-    适用场景：
-    - 用户询问最新行情："XX车现在有什么优惠？"
-    - 查询口碑："XX车车主评价怎么样？"
-    - 了解市场动态："2025年最值得买的SUV"
+    返回：最新优惠政策、车主口碑、行业新闻、保值率/销量数据。
 
     Args:
-        query: 搜索关键词。例如 "比亚迪宋PLUS 2025款 最新优惠 口碑"。
-
+        query: 搜索关键词。例如 "比亚迪宋PLUS 2025款 最新优惠"。
     Returns:
         JSON 字符串，包含 Tavily 实时搜索结果。
     """
@@ -335,185 +450,8 @@ def _mock_search(query: str) -> dict:
     }
 
 
-@tool
-def rag_search(query: str) -> str:
-    """语义搜索车型文档库，获取深度信息。
-
-    当用户的需求比较模糊、或者结构化搜索匹配不到结果时，
-    使用此工具基于语义相似度从车型文档中检索相关内容。
-
-    覆盖的信息包括：
-    - 车型核心卖点和详细介绍（~260字/车）
-    - 用户口碑（优缺点）
-    - 适用场景推荐
-    - 详细参数列表
-
-    适用场景：
-    - 用户需求模糊：如"我想要一辆舒服的车"、"适合新手开的车"
-    - 结构化搜索返回太少结果时自动兜底
-    - 需要了解车型口碑和实际使用体验
-
-    Args:
-        query: 自然语言查询。例如 "省油的家用SUV推荐"、"长途开什么车舒服"。
-
-    Returns:
-        JSON 字符串，包含相关文档片段列表。
-        每个结果包含 content（文本内容）、title（车型名）、
-        category（类别）、energy_type（能源类型）、
-        price_range（价格区间）、section（文档类型）等字段。
-    """
-    try:
-        from .rag.retriever import _get_store
-    except ImportError:
-        return json.dumps(
-            {"error": "RAG 模块未加载，请先运行 data/build_index.py 构建索引"},
-            ensure_ascii=False,
-        )
-
-    store = _get_store()
-    docs = store.search(query, k=5)
-
-    results = []
-    for doc in docs:
-        results.append({
-            "content": doc.page_content[:400],
-            "title": doc.metadata.get("title", ""),
-            "category": doc.metadata.get("category", ""),
-            "energy_type": doc.metadata.get("energy_type", ""),
-            "price_range": doc.metadata.get("price_range", ""),
-            "section": doc.metadata.get("section", ""),
-            "source": doc.metadata.get("source", ""),
-        })
-
-    logger.info("rag_search: '%s' → %d results", query[:60], len(results))
-    return json.dumps(results, ensure_ascii=False, indent=2)
-
-
-# ==========================================================================
-# 内部：去重合并
-# ==========================================================================
-
-
-def _merge_and_dedupe(
-    structured: list[dict],
-    rag_results: list[dict],
-    max_items: int = 5,
-) -> list[dict]:
-    """合并结构化搜索和 RAG 结果，按车型名去重。
-
-    Args:
-        structured: 结构化搜索结果。
-        rag_results: RAG 语义搜索结果。
-        max_items:   返回最大条数。
-
-    Returns:
-        去重合并后的车型列表。
-    """
-    seen: set[str] = set()
-    merged: list[dict] = []
-
-    def _key(item: dict) -> str:
-        return (item.get("title", "") or item.get("name", "")).lower()
-
-    # 先放结构化结果
-    for item in structured:
-        k = _key(item)
-        if k and k not in seen:
-            seen.add(k)
-            merged.append(item)
-
-    # 再补充 RAG 结果
-    for item in rag_results:
-        k = _key(item)
-        if k and k not in seen:
-            seen.add(k)
-            # 转换为简化格式
-            merged.append({
-                "name": item.get("title", ""),
-                "category": item.get("category", ""),
-                "energy_type": item.get("energy_type", ""),
-                "price_range": item.get("price_range", ""),
-                "section": item.get("section", ""),
-                "content": item.get("content", "")[:200],
-                "source": "语义检索",
-            })
-
-    return merged[:max_items]
-
-
-# ==========================================================================
-# 修改 search_local_cars：结果不足时自动 RAG 兜底
-# ==========================================================================
-
-# 保存原始的 search_local_cars 逻辑，用于重新包装
-_search_local_cars_original = search_local_cars
-
-
-@tool
-def search_local_cars(budget: str, vehicle_type: str = "") -> str:  # type: ignore[no-redef]
-    """搜索符合预算和车型偏好的车辆（结构化匹配 + 语义兜底）。
-
-    优先使用价格区间和车型类型进行精确筛选。当匹配结果少于
-    3 条时，自动调用语义搜索补充相关车型，确保用户总能获得
-    足够的选择参考。
-
-    适用场景：
-    - 用户明确给出预算和/或车型偏好
-    - 如 "15-20万SUV"、"10万以内的轿车"
-    - 这是大多数场景的首选工具
-
-    Args:
-        budget:       预算区间。例如 "15-20万"、"20万左右"、"10万以内"。
-        vehicle_type: 车型偏好。例如 "SUV"、"轿车"、"MPV"。留空不限。
-
-    Returns:
-        JSON 字符串，包含匹配的车型列表（≥3条时有兜底）。
-        每项含 name、price_range、type、fuel、pros、cons 等。
-    """
-    # 先用结构化搜索
-    raw = _search_local_cars_original.invoke({"budget": budget, "vehicle_type": vehicle_type})
-    results = json.loads(raw)
-
-    # 预算无法解析 → 直接返回错误，不触发 RAG 兜底
-    if isinstance(results, dict) and "error" in results:
-        return json.dumps(results, ensure_ascii=False, indent=2)
-
-    # 结果 >= 3 条，直接返回
-    if len(results) >= 3:
-        logger.info("search_local_cars: %d results (no RAG needed)", len(results))
-        return json.dumps({"results": results, "source": "结构化搜索"}, ensure_ascii=False, indent=2)
-
-    # 结果不足，RAG 兜底
-    logger.info("search_local_cars: only %d results, falling back to RAG", len(results))
-
-    # 构建语义搜索查询
-    rag_query_parts = []
-    if vehicle_type:
-        rag_query_parts.append(vehicle_type)
-    rag_query_parts.append(f"预算{budget}")
-    rag_query = " ".join(rag_query_parts)
-
-    try:
-        rag_raw = rag_search.invoke({"query": rag_query})
-        rag_results = json.loads(rag_raw)
-    except Exception:
-        logger.warning("RAG fallback failed, returning structured results only")
-        return json.dumps(
-            {"results": results, "source": "结构化搜索（结果不足，语义搜索不可用）"},
-            ensure_ascii=False, indent=2,
-        )
-
-    merged = _merge_and_dedupe(results, rag_results)
-    logger.info("search_local_cars: merged → %d results", len(merged))
-
-    return json.dumps(
-        {"results": merged, "source": f"结构化({len(results)}条) + 语义搜索({len(rag_results)}条)"},
-        ensure_ascii=False, indent=2,
-    )
-
-
 # ==========================================================================
 # 工具列表
 # ==========================================================================
 
-tools = [search_local_cars, compare_cars, search_online, rag_search]
+tools = [search_local_cars, compare_cars, search_online]

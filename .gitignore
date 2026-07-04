@@ -14,11 +14,9 @@ venv/
 .vscode/
 .idea/
 
-# Vector database
-chroma_db/
-
 # Eval output
 data/eval_results.json
 
 # Session persistence
 checkpoints.db
+sessions.db

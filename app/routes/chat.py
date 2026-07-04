@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from app.services.agent_service import AgentService
+from car_advisor.src.session_store import get_messages, save_session, save_message
+from car_advisor.src.prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -83,14 +85,25 @@ async def chat(request: ChatRequest) -> ChatResponse:
     thread_id = request.thread_id or f"session_{uuid.uuid4().hex[:8]}"
     logger.info("POST /chat: thread=%s input=%.60s", thread_id, request.user_input)
 
+    # 从 DB 加载历史 + 追加新消息 = 完整上下文
+    # 过滤掉 tool 消息，只保留 user/assistant（避免 tool_calls 序列损坏）
+    history = get_messages(thread_id)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for h in history:
+        if h["role"] in ("user", "assistant"):
+            messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": request.user_input})
+
     try:
-        result = await agent_service.ainvoke(
-            user_input=request.user_input,
-            thread_id=thread_id,
-        )
+        result = await agent_service.ainvoke(messages=messages)
     except Exception as exc:
         logger.exception("POST /chat failed")
         raise HTTPException(status_code=500, detail=f"Agent 调用失败: {exc}")
+
+    # 保存到 DB
+    save_session(thread_id, request.user_input, request.user_input[:24])
+    save_message(thread_id, "user", request.user_input)
+    save_message(thread_id, "assistant", result["response"], result.get("final_recommendation"))
 
     return ChatResponse(
         response=result["response"],
@@ -120,19 +133,35 @@ async def chat_stream(request: ChatRequest):
     thread_id = request.thread_id or f"session_{uuid.uuid4().hex[:8]}"
     logger.info("POST /chat/stream: thread=%s input=%.60s", thread_id, request.user_input)
 
+    # 从 DB 加载历史 + 追加新消息（过滤 tool 消息）
+    history = get_messages(thread_id)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for h in history:
+        if h["role"] in ("user", "assistant"):
+            messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": request.user_input})
+
     async def event_generator():
         try:
-            async for chunk in agent_service.astream(
-                user_input=request.user_input,
-                thread_id=thread_id,
-            ):
+            # 保存用户消息
+            save_session(thread_id, request.user_input, request.user_input[:24])
+            save_message(thread_id, "user", request.user_input)
+
+            assistant_response = ""
+            assistant_rec = None
+
+            async for chunk in agent_service.astream(messages=messages):
                 event_type = chunk.get("event", "message")
+                data = chunk.get("data") or {}
+                if event_type == "message":
+                    assistant_response = data.get("content", "")
+                elif event_type == "final_recommendation":
+                    assistant_rec = data
+                elif event_type == "done":
+                    save_message(thread_id, "assistant", assistant_response, assistant_rec)
                 yield {
                     "event": event_type,
-                    "data": StreamEvent(
-                        event=event_type,
-                        data=chunk.get("data"),
-                    ).model_dump_json(),
+                    "data": StreamEvent(event=event_type, data=data).model_dump_json(),
                 }
         except Exception as exc:
             logger.exception("POST /chat/stream failed")

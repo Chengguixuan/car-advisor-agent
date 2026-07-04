@@ -1,7 +1,7 @@
 """Agent 调用封装。
 
 将 LangGraph Agent 包装为可复用的服务层，提供：
-- 单例 agent 实例（共享 MemorySaver）
+- 单例 agent 实例
 - 同步/异步调用接口
 - 流式输出支持
 - 请求日志和耗时统计
@@ -13,15 +13,12 @@ import sys
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from langchain_core.messages import HumanMessage
-
 # 确保 car_advisor 包可导入
 _project_root = Path(__file__).resolve().parent.parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from car_advisor.src.graph import build_agent
-from car_advisor.src.prompts import SYSTEM_PROMPT
 from car_advisor.src.utils import serialize_messages
 
 logger = logging.getLogger(__name__)
@@ -58,155 +55,48 @@ class AgentService:
     # 同步调用
     # ------------------------------------------------------------------
 
-    def invoke(
-        self,
-        user_input: str,
-        thread_id: str = "default",
-    ) -> dict[str, Any]:
-        """同步调用 Agent，返回完整结果。
+    def invoke(self, messages: list[dict]) -> dict[str, Any]:
+        """同步调用 Agent，传入完整消息历史。
 
         Args:
-            user_input: 用户消息文本。
-            thread_id:  会话 ID（同一 id 共享上下文）。
+            messages: 完整消息列表 [{"role":..., "content":...}, ...]。
 
         Returns:
-            包含以下字段的字典：
-            - response:           最终消息文本（JSON 字符串）
-            - final_recommendation: 结构化推荐结果（如有）
-            - messages:           完整对话历史
-            - elapsed_ms:         耗时（毫秒）
+            {"response": ..., "final_recommendation": ..., "messages": ..., "elapsed_ms": ...}
         """
         agent = self.get_agent()
-        config = {"configurable": {"thread_id": thread_id}}
-
         t0 = time.perf_counter()
-        logger.info("invoke start: thread=%s input=%.60s", thread_id, user_input)
+        logger.info("invoke start: msgs=%d", len(messages))
 
-        input_state = {
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                HumanMessage(content=user_input),
-            ],
-        }
-
-        result = agent.invoke(input_state, config=config)
-
+        result = agent.invoke({"messages": messages})
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        messages = result.get("messages", [])
+        all_msgs = result.get("messages", [])
         rec = result.get("final_recommendation")
-        msg_count = len(messages)
+        response = _extract_response(all_msgs)
+        logger.info("invoke done: msgs=%d elapsed=%.0fms", len(all_msgs), elapsed_ms)
+        return {"response": response, "final_recommendation": rec, "messages": all_msgs, "elapsed_ms": round(elapsed_ms, 1)}
 
-        # 提取最后一条助手消息
-        response = ""
-        for m in reversed(messages):
-            role = getattr(m, "type", "") or getattr(m, "role", "")
-            if role in ("ai", "assistant"):
-                response = getattr(m, "content", "") or ""
-                break
-
-        logger.info(
-            "invoke done: thread=%s msgs=%d elapsed=%.0fms has_rec=%s",
-            thread_id, msg_count, elapsed_ms, rec is not None,
-        )
-
-        return {
-            "response": response,
-            "final_recommendation": rec,
-            "messages": messages,
-            "elapsed_ms": round(elapsed_ms, 1),
-        }
-
-    # ------------------------------------------------------------------
-    # 异步调用
-    # ------------------------------------------------------------------
-
-    async def ainvoke(
-        self,
-        user_input: str,
-        thread_id: str = "default",
-    ) -> dict[str, Any]:
-        """异步调用 Agent，返回完整结果。
-
-        与 invoke() 参数和返回值相同，适用于 FastAPI async 路由。
-        """
+    async def ainvoke(self, messages: list[dict]) -> dict[str, Any]:
+        """异步调用 Agent。"""
         agent = self.get_agent()
-        config = {"configurable": {"thread_id": thread_id}}
-
         t0 = time.perf_counter()
-        logger.info("ainvoke start: thread=%s input=%.60s", thread_id, user_input)
-
-        input_state = {
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                HumanMessage(content=user_input),
-            ],
-        }
-
-        result = await agent.ainvoke(input_state, config=config)
-
+        result = await agent.ainvoke({"messages": messages})
         elapsed_ms = (time.perf_counter() - t0) * 1000
-        messages = result.get("messages", [])
+        all_msgs = result.get("messages", [])
         rec = result.get("final_recommendation")
+        response = _extract_response(all_msgs)
+        return {"response": response, "final_recommendation": rec, "messages": all_msgs, "elapsed_ms": round(elapsed_ms, 1)}
 
-        response = ""
-        for m in reversed(messages):
-            role = getattr(m, "type", "") or getattr(m, "role", "")
-            if role in ("ai", "assistant"):
-                response = getattr(m, "content", "") or ""
-                break
+    async def astream(self, messages: list[dict]) -> AsyncIterator[dict[str, Any]]:
+        """异步流式调用，传入完整消息历史。
 
-        logger.info(
-            "ainvoke done: thread=%s msgs=%d elapsed=%.0fms",
-            thread_id, len(messages), elapsed_ms,
-        )
-
-        return {
-            "response": response,
-            "final_recommendation": rec,
-            "messages": messages,
-            "elapsed_ms": round(elapsed_ms, 1),
-        }
-
-    # ------------------------------------------------------------------
-    # 流式输出
-    # ------------------------------------------------------------------
-
-    async def astream(
-        self,
-        user_input: str,
-        thread_id: str = "default",
-    ) -> AsyncIterator[dict[str, Any]]:
-        """异步流式调用 Agent，逐步返回状态变化。
-
-        每次 yield 一个状态块，前端可据此展示实时进度。
-
-        Yields:
-            {"event": str, "data": Any} 格式的字典：
-            - event="start":     流开始
-            - event="tool_call": LLM 请求调用工具（含 tools 列表）
-            - event="tool_result": 工具执行结果（含 results）
-            - event="message":   助手文本消息
-            - event="final_recommendation": 最终推荐
-            - event="done":      流结束（含 elapsed_ms）
-            - event="error":     错误
+        Yields: start → tool_call → tool_result → message → final_recommendation → done
         """
         agent = self.get_agent()
-        config = {"configurable": {"thread_id": thread_id}}
-
         t0 = time.perf_counter()
-        logger.info("astream start: thread=%s input=%.60s", thread_id, user_input)
-
-        input_state = {
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                HumanMessage(content=user_input),
-            ],
-        }
-
         try:
             yield {"event": "start", "data": None}
-
-            async for step in agent.astream(input_state, config=config, stream_mode="updates"):
+            async for step in agent.astream({"messages": messages}, stream_mode="updates"):
                 for node_name, node_output in step.items():
                     messages = node_output.get("messages", [])
 
@@ -255,10 +145,17 @@ class AgentService:
 
             elapsed_ms = (time.perf_counter() - t0) * 1000
             yield {"event": "done", "data": {"elapsed_ms": round(elapsed_ms, 1)}}
-            logger.info("astream done: thread=%s elapsed=%.0fms", thread_id, elapsed_ms)
+            logger.info("astream done: elapsed=%.0fms", elapsed_ms)
 
         except Exception as exc:
-            logger.exception("astream error: thread=%s", thread_id)
+            logger.exception("astream error")
             yield {"event": "error", "data": {"message": str(exc)}}
 
 
+def _extract_response(messages: list) -> str:
+    """从消息列表中提取最后一条助手回复文本。"""
+    for m in reversed(messages):
+        role = getattr(m, "type", "") or getattr(m, "role", "")
+        if role in ("ai", "assistant"):
+            return getattr(m, "content", "") or ""
+    return ""

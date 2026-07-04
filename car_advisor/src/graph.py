@@ -13,9 +13,6 @@ import re
 from typing import Any, Literal
 
 from langchain_openai import ChatOpenAI
-import sqlite3
-from pathlib import Path
-from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
@@ -29,11 +26,19 @@ from .utils import get_role
 logger = logging.getLogger(__name__)
 
 # 最大搜索次数，防止 Agent 无限循环
-_MAX_SEARCHES = 3
+_MAX_SEARCHES = 6
 
 # 上下文压缩阈值（消息条数超过此值触发压缩）
 _COMPRESS_THRESHOLD = 10          # 5 轮对话
 _COMPRESS_KEEP_LAST = 10          # 最近 10 条消息不压缩
+# 强制调用 search_online 的关键词
+_SEARCH_ONLINE_KEYWORDS = ["优惠", "降价", "行情", "多少钱", "口碑", "评价", "车主", "销量", "新闻", "促销"]
+
+
+def _should_force_search_online(user_msg: str) -> bool:
+    return any(kw in user_msg for kw in _SEARCH_ONLINE_KEYWORDS)
+
+
 _SUMMARY_PROMPT = (
     "请用2-3句话总结以下对话的核心信息，包括用户需求、排除项和已推荐的车型。"
     "只输出摘要文本，不要包含任何其他内容。"
@@ -190,7 +195,7 @@ def build_agent() -> StateGraph:
         search_count 达到 _MAX_SEARCHES 后，强制路由到 finalize。
 
     Returns:
-        编译后的 StateGraph，含 SqliteSaver checkpointer。
+        编译后的 StateGraph（无 checkpointer，调用方传入完整历史）。
     """
     llm = _build_llm()
     model_with_tools = llm.bind_tools(tools)
@@ -328,6 +333,30 @@ def build_agent() -> StateGraph:
                 result["history_summary"] = second["content"]
 
         tool_calls = getattr(response, "tool_calls", []) or []
+
+        # 强制路由：用户问实时信息但 LLM 没调 search_online（仅首次）
+        already_called = state.get("called_tools", [])
+        if not tool_calls and "search_online" not in already_called:
+            last_user_msg = ""
+            for m in reversed(messages):
+                r = get_role(m)
+                if r in ("user", "human"):
+                    last_user_msg = m.get("content", "") if isinstance(m, dict) else getattr(m, "content", "")
+                    break
+            if _should_force_search_online(last_user_msg):
+                logger.info("chatbot: forcing search_online for: %.60s", last_user_msg)
+                from langchain_core.messages import AIMessage
+                forced_msg = AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "search_online",
+                        "args": {"query": last_user_msg},
+                        "id": "force_search_online",
+                        "type": "tool_call",
+                    }]
+                )
+                return {"messages": [forced_msg]}
+
         logger.info(
             "chatbot: role=%s, tool_calls=%d, compressed=%s",
             getattr(response, "role", "?"), len(tool_calls), compression_applied,
@@ -355,12 +384,19 @@ def build_agent() -> StateGraph:
                 "search_count": current_count + 1,
             }
 
-        # 提取候选车型
+        # 提取候选车型 + 记录调用的工具名
         all_messages = list(state.get("messages", [])) + result.get("messages", [])
         candidates = _parse_candidates_from_messages(all_messages)
 
+        called = list(state.get("called_tools", []))
+        for msg in result.get("messages", []):
+            tname = getattr(msg, "name", None) or (msg.get("name", "") if isinstance(msg, dict) else "")
+            if tname and tname not in called:
+                called.append(tname)
+
         result["candidates"] = candidates if candidates else state.get("candidates")
         result["search_count"] = current_count + 1
+        result["called_tools"] = called
 
         logger.info(
             "tool_node: done — %d candidates found, search_count=%d",
@@ -410,12 +446,20 @@ def build_agent() -> StateGraph:
         else:
             summary = "未找到匹配的候选车型，请根据对话内容给出建议。"
 
+        candidate_count = len(candidates)
+        table_hint = ""
+        if candidate_count >= 2:
+            table_hint = (
+                "同时必须输出 tradeoff_summary（2-4句权衡说明）和 comparison_table（参数对比表格）。"
+            )
         finalize_prompt = (
             f"{summary}\n\n"
             "请根据以上候选车型和之前的对话内容，生成最终的购车推荐。"
             "以 JSON 格式输出，包含 understanding（需求理解）、"
             "recommended_models（推荐车型列表，每款含 name/price_range/pros/cons/reason）、"
-            "follow_up_question（信息不足时追问，否则 null）。"
+            f"follow_up_question（信息不足时追问，否则 null）。{table_hint}"
+            "注意：如果用户指定了具体车型进行对比，recommended_models 只能包含"
+            "用户指定的车型，不得追加任何新车。"
         )
 
         # 过滤消息：仅保留 system / user / assistant-text 供 LLM 生成推荐
@@ -514,8 +558,4 @@ def build_agent() -> StateGraph:
     graph.add_edge("tools", "chatbot")
     graph.add_edge("finalize", END)
 
-    # SqliteSaver 持久化到本地文件，重启后保留对话历史
-    db_path = Path(__file__).resolve().parent.parent.parent / "checkpoints.db"
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    checkpointer = SqliteSaver(conn)
-    return graph.compile(checkpointer=checkpointer)
+    return graph.compile()

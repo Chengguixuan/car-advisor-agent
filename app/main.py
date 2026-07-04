@@ -20,7 +20,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routes import chat_router
+from app.routes import chat_router, conversation_router
 
 logger = logging.getLogger(__name__)
 
@@ -29,21 +29,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时预加载 Agent。"""
     logger.info("starting Car Advisor API server...")
-    # 预加载 AgentService + 向量索引
     try:
-        import sys
-        from pathlib import Path
-        _root = Path(__file__).resolve().parent.parent
-        if str(_root) not in sys.path:
-            sys.path.insert(0, str(_root))
         from app.services.agent_service import AgentService
         svc = AgentService()
         svc.get_agent()  # 预热 Agent
         logger.info("agent preloaded")
-        from car_advisor.src.rag.vector_store import CarVectorStore
-        store = CarVectorStore()
-        _ = store._get_store()
-        logger.info("vector index loaded")
     except Exception as e:
         logger.warning("preload failed (will lazy-load on first request): %s", e)
     yield
@@ -55,6 +45,7 @@ app = FastAPI(
     description="基于 LangGraph + RAG 的智能购车顾问服务",
     version="1.0.0",
     lifespan=lifespan,
+    default_response_class=JSONResponse,
 )
 
 # CORS
@@ -68,6 +59,7 @@ app.add_middleware(
 
 # 路由注册
 app.include_router(chat_router)
+app.include_router(conversation_router)
 
 
 # ---------------------------------------------------------------------------
@@ -103,11 +95,14 @@ async def health():
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    """记录每个请求的耗时和状态。"""
+    """记录请求耗时 + 确保 UTF-8 编码。"""
     t0 = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     logger.info("%s %s → %d (%.0fms)", request.method, request.url.path, response.status_code, elapsed_ms)
+    ct = response.headers.get("content-type", "")
+    if ("text/" in ct or "application/json" in ct) and "charset" not in ct:
+        response.headers["content-type"] = ct + "; charset=utf-8"
     return response
 
 
